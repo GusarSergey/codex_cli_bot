@@ -38,6 +38,9 @@ from ..engine_overrides import supports_reasoning
 
 logger = get_logger(__name__)
 
+_TYPING_ACTION = "typing"
+_TYPING_HEARTBEAT_SECONDS = 4.0
+
 
 @dataclass(slots=True)
 class _ResumeLineProxy:
@@ -184,6 +187,26 @@ async def _run_engine(
         thread_id=thread_id,
     )
 
+    async def _typing_heartbeat(stop_event: anyio.Event) -> None:
+        while True:
+            try:
+                await exec_cfg.transport.send_chat_action(
+                    channel_id=chat_id,
+                    action=_TYPING_ACTION,
+                    thread_id=thread_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "telegram.typing.failed",
+                    chat_id=chat_id,
+                    error=str(exc),
+                    error_type=exc.__class__.__name__,
+                )
+            with anyio.move_on_after(_TYPING_HEARTBEAT_SECONDS):
+                await stop_event.wait()
+            if stop_event.is_set():
+                return
+
     # Reject new runs while draining for restart
     from ...shutdown import is_shutting_down
 
@@ -261,20 +284,26 @@ async def _run_engine(
                 reply_to=reply_ref,
                 thread_id=thread_id,
             )
-            with apply_run_options(run_options):
-                await handle_message(
-                    exec_cfg,
-                    runner=runner,
-                    incoming=incoming,
-                    resume_token=resume_token,
-                    context=context,
-                    context_line=context_line,
-                    strip_resume_line=runtime.is_resume_line,
-                    running_tasks=running_tasks,
-                    on_thread_known=on_thread_known,
-                    on_resume_failed=on_resume_failed,
-                    progress_ref=progress_ref,
-                )
+            typing_stop = anyio.Event()
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_typing_heartbeat, typing_stop)
+                try:
+                    with apply_run_options(run_options):
+                        await handle_message(
+                            exec_cfg,
+                            runner=runner,
+                            incoming=incoming,
+                            resume_token=resume_token,
+                            context=context,
+                            context_line=context_line,
+                            strip_resume_line=runtime.is_resume_line,
+                            running_tasks=running_tasks,
+                            on_thread_known=on_thread_known,
+                            on_resume_failed=on_resume_failed,
+                            progress_ref=progress_ref,
+                        )
+                finally:
+                    typing_stop.set()
         finally:
             reset_run_base_dir(run_base_token)
             reset_run_channel_id(run_channel_token)
@@ -292,6 +321,7 @@ class _CaptureTransport:
     def __init__(self) -> None:
         self._next_id = 1
         self.last_message: RenderedMessage | None = None
+        self.chat_actions: list[dict[str, Any]] = []
 
     async def send(
         self,
@@ -317,6 +347,22 @@ class _CaptureTransport:
         return ref
 
     async def delete(self, *, ref: MessageRef) -> bool:
+        return True
+
+    async def send_chat_action(
+        self,
+        *,
+        channel_id: int | str,
+        action: str,
+        thread_id: int | str | None = None,
+    ) -> bool:
+        self.chat_actions.append(
+            {
+                "channel_id": channel_id,
+                "action": action,
+                "thread_id": thread_id,
+            }
+        )
         return True
 
     async def close(self) -> None:

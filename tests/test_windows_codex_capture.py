@@ -20,6 +20,7 @@ class _FakePopen:
         stderr_data: bytes,
         returncode: int,
         captured: dict,
+        **kwargs,
     ) -> None:
         self.pid = 43210
         self.returncode = returncode
@@ -29,6 +30,8 @@ class _FakePopen:
         captured["stderr"] = stderr
         captured["env"] = env
         captured["cwd"] = cwd
+        captured["creationflags"] = kwargs.pop("creationflags", None)
+        captured["startupinfo"] = kwargs.pop("startupinfo", None)
         self._stdout_data = stdout_data
         self._stderr_data = stderr_data
         self._captured = captured
@@ -61,6 +64,15 @@ async def test_codex_runner_windows_blocking_capture_success(monkeypatch) -> Non
         )
 
     monkeypatch.setattr(os, "name", "nt", raising=False)
+    monkeypatch.setattr(runner_module.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr(runner_module.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)
+    monkeypatch.setattr(runner_module.subprocess, "SW_HIDE", 0, raising=False)
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "STARTUPINFO",
+        lambda: type("_StartupInfo", (), {"dwFlags": 0, "wShowWindow": None})(),
+        raising=False,
+    )
     monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
 
     runner = CodexRunner(codex_cmd="codex.cmd", extra_args=["-c", "notify=[]"])
@@ -73,6 +85,9 @@ async def test_codex_runner_windows_blocking_capture_success(monkeypatch) -> Non
     assert completed.answer == "OK"
     assert captured["payload"] == b"Reply with exactly: OK"
     assert captured["cmd"][0] == "codex.cmd"
+    assert captured["creationflags"] == 0x08000000
+    assert captured["startupinfo"] is not None
+    assert captured["startupinfo"].dwFlags & 1 == 1
 
 
 @pytest.mark.anyio

@@ -333,6 +333,23 @@ async def test_telegram_transport_passes_reply_markup() -> None:
 
 
 @pytest.mark.anyio
+async def test_telegram_transport_sends_chat_action() -> None:
+    bot = FakeBot()
+    transport = TelegramTransport(bot)
+
+    ok = await transport.send_chat_action(
+        channel_id=123,
+        action="typing",
+        thread_id=7,
+    )
+
+    assert ok is True
+    assert bot.chat_action_calls == [
+        {"chat_id": 123, "action": "typing", "message_thread_id": 7}
+    ]
+
+
+@pytest.mark.anyio
 async def test_telegram_transport_sends_followups() -> None:
     bot = FakeBot()
     transport = TelegramTransport(bot)
@@ -1785,6 +1802,48 @@ async def test_run_engine_hides_resume_line_in_topics() -> None:
 
     assert transport.last_message is not None
     assert "resume-123" not in transport.last_message.text
+
+
+@pytest.mark.anyio
+async def test_run_engine_sends_typing_indicator() -> None:
+    transport = _CaptureTransport()
+    runner = ScriptRunner(
+        [Sleep(0.05), Return(answer="ok")],
+        engine=CODEX_ENGINE,
+        resume_value="resume-123",
+    )
+    exec_cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    runtime = TransportRuntime(
+        router=_make_router(runner),
+        projects=_empty_projects(),
+    )
+
+    await _run_engine(
+        exec_cfg=exec_cfg,
+        runtime=runtime,
+        running_tasks={},
+        chat_id=123,
+        user_msg_id=1,
+        text="hello",
+        resume_token=None,
+        context=None,
+        reply_ref=None,
+        on_thread_known=None,
+        engine_override=None,
+        thread_id=77,
+        show_resume_line=False,
+    )
+
+    assert transport.chat_actions
+    assert transport.chat_actions[0] == {
+        "channel_id": 123,
+        "action": "typing",
+        "thread_id": 77,
+    }
 
 
 @pytest.mark.anyio

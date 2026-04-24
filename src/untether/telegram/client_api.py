@@ -135,6 +135,13 @@ class BotClient(Protocol):
         name: str,
     ) -> bool: ...
 
+    async def send_chat_action(
+        self,
+        chat_id: int,
+        action: str,
+        message_thread_id: int | None = None,
+    ) -> bool: ...
+
 
 class HttpBotClient:
     def __init__(
@@ -351,6 +358,18 @@ class HttpBotClient:
     async def get_file(self, file_id: str) -> File | None:
         result = await self._post("getFile", {"file_id": file_id})
         return self._decode_result(method="getFile", payload=result, model=File)
+
+    async def send_chat_action(
+        self,
+        chat_id: int,
+        action: str,
+        message_thread_id: int | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {"chat_id": chat_id, "action": action}
+        if message_thread_id is not None:
+            payload["message_thread_id"] = message_thread_id
+        result = await self._post("sendChatAction", payload)
+        return bool(result)
 
     async def download_file(self, file_path: str) -> bytes | None:
         # #204: reject file_path values that could redirect the request away

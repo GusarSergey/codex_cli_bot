@@ -333,6 +333,25 @@ class JsonlSubprocessRunner(BaseRunner):
     last_pid: int | None = None
     _prefer_blocking_subprocess_on_windows: bool = False
 
+    @staticmethod
+    def _windows_popen_kwargs() -> dict[str, Any]:
+        if os.name != "nt":
+            return {}
+        kwargs: dict[str, Any] = {}
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+        startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+        startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        sw_hide = getattr(subprocess, "SW_HIDE", 0)
+        if startupinfo_factory is not None:
+            startupinfo = startupinfo_factory()
+            if startf_use_showwindow:
+                startupinfo.dwFlags |= startf_use_showwindow
+            startupinfo.wShowWindow = sw_hide
+            kwargs["startupinfo"] = startupinfo
+        return kwargs
+
     def get_logger(self) -> Any:
         return getattr(self, "logger", get_logger(__name__))
 
@@ -1084,6 +1103,7 @@ class JsonlSubprocessRunner(BaseRunner):
             stderr=subprocess.PIPE,
             env=env,
             cwd=cwd,
+            **self._windows_popen_kwargs(),
         )
         stdout_data, stderr_data = proc.communicate(payload)
         return (
@@ -1232,6 +1252,7 @@ class JsonlSubprocessRunner(BaseRunner):
             stderr=subprocess.PIPE,
             env=env,
             cwd=cwd,
+            **self._windows_popen_kwargs(),
         ) as proc:
             if proc.stdout is None or proc.stderr is None:
                 logger.error(

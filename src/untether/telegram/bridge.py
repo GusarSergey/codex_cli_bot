@@ -392,6 +392,30 @@ class TelegramTransport:
             )
             return False
 
+    async def send_chat_action(
+        self,
+        *,
+        channel_id: int | str,
+        action: str,
+        thread_id: int | str | None = None,
+    ) -> bool:
+        try:
+            return await self._bot.send_chat_action(
+                chat_id=cast(int, channel_id),
+                action=action,
+                message_thread_id=cast(int | None, thread_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "transport.chat_action.failed",
+                chat_id=channel_id,
+                action=action,
+                thread_id=thread_id,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            return False
+
 
 async def send_plain(
     transport: Transport,

@@ -314,6 +314,30 @@ class TelegramClient:
             )
         )
 
+    async def send_chat_action(
+        self,
+        chat_id: int,
+        action: str,
+        message_thread_id: int | None = None,
+    ) -> bool:
+        async def execute() -> bool:
+            return await self._client.send_chat_action(
+                chat_id=chat_id,
+                action=action,
+                message_thread_id=message_thread_id,
+            )
+
+        return bool(
+            await self.enqueue_op(
+                key=("chat_action", chat_id, message_thread_id, action),
+                label="send_chat_action",
+                execute=execute,
+                priority=SEND_PRIORITY,
+                chat_id=chat_id,
+                wait=False,
+            )
+        )
+
     async def get_me(self) -> User | None:
         async def execute() -> User | None:
             return await self._client.get_me()

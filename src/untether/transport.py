@@ -51,3 +51,11 @@ class Transport(Protocol):
     ) -> MessageRef | None: ...
 
     async def delete(self, *, ref: MessageRef) -> bool: ...
+
+    async def send_chat_action(
+        self,
+        *,
+        channel_id: ChannelId,
+        action: str,
+        thread_id: ThreadId | None = None,
+    ) -> bool: ...

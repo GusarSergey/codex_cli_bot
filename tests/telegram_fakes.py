@@ -41,6 +41,7 @@ class FakeTransport:
         self.send_calls: list[dict] = []
         self.edit_calls: list[dict] = []
         self.delete_calls: list[MessageRef] = []
+        self.chat_action_calls: list[dict] = []
         self.progress_ready = progress_ready
         self.progress_ref: MessageRef | None = None
 
@@ -82,6 +83,22 @@ class FakeTransport:
         self.delete_calls.append(ref)
         return True
 
+    async def send_chat_action(
+        self,
+        *,
+        channel_id: int | str,
+        action: str,
+        thread_id: int | str | None = None,
+    ) -> bool:
+        self.chat_action_calls.append(
+            {
+                "channel_id": channel_id,
+                "action": action,
+                "thread_id": thread_id,
+            }
+        )
+        return True
+
     async def close(self) -> None:
         return None
 
@@ -91,6 +108,7 @@ class FakeBot(BotClient):
         self.command_calls: list[dict] = []
         self.callback_calls: list[dict] = []
         self.send_calls: list[dict] = []
+        self.chat_action_calls: list[dict] = []
         self.document_calls: list[dict] = []
         self.edit_calls: list[dict] = []
         self.edit_topic_calls: list[dict[str, Any]] = []
@@ -235,6 +253,21 @@ class FakeBot(BotClient):
                 "chat_id": chat_id,
                 "message_thread_id": message_thread_id,
                 "name": name,
+            }
+        )
+        return True
+
+    async def send_chat_action(
+        self,
+        chat_id: int,
+        action: str,
+        message_thread_id: int | None = None,
+    ) -> bool:
+        self.chat_action_calls.append(
+            {
+                "chat_id": chat_id,
+                "action": action,
+                "message_thread_id": message_thread_id,
             }
         )
         return True
