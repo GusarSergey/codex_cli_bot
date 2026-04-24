@@ -1,0 +1,14 @@
+.venv/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.mutmut-cache/
+mutants/
+uv.lock
+_site/
+docs/reference/changelog.md
+.worktrees/
+research/
+incoming/

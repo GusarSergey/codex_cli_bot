@@ -1,0 +1,173 @@
+[project]
+name = "untether"
+authors = [{name = "Little Bear Apps", email = "hello@littlebearapps.com"}]
+maintainers = [{name = "Little Bear Apps", email = "hello@littlebearapps.com"}]
+version = "0.35.2"
+keywords = ["telegram", "claude-code", "codex", "opencode", "pi", "gemini-cli", "amp", "ai-agents", "coding-assistant", "remote-control", "cli-bridge"]
+description = "Run AI coding agents from your phone. Bridges Claude Code, Codex, OpenCode, Pi, Gemini CLI, and Amp to Telegram with interactive permissions, voice input, cost tracking, and live progress."
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+  "aiohttp>=3.9.0",
+  "anyio>=4.12.0",
+  "httpx>=0.28.1",
+  "markdown-it-py[linkify]",
+  "msgspec>=0.20.0",
+  "openai>=2.15.0",
+  "pydantic>=2.12.5",
+  "pydantic-settings>=2.12.0",
+  "questionary>=2.1.1",
+  "rich>=14.2.0",
+  "structlog>=25.5.0",
+  "sulguk>=0.11.1",
+  "tomli-w>=1.2.0",
+  "typer>=0.21.0",
+  "watchfiles>=0.21.0",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Communications :: Chat",
+  "Topic :: Software Development :: Build Tools",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/littlebearapps/untether"
+Repository = "https://github.com/littlebearapps/untether"
+Issues = "https://github.com/littlebearapps/untether/issues"
+Documentation = "https://littlebearapps.com/tools/untether/"
+Changelog = "https://github.com/littlebearapps/untether/blob/master/CHANGELOG.md"
+Upstream = "https://github.com/banteg/takopi"
+
+[project.scripts]
+untether = "untether.cli:main"
+
+[project.entry-points."untether.engine_backends"]
+codex = "untether.runners.codex:BACKEND"
+claude = "untether.runners.claude:BACKEND"
+opencode = "untether.runners.opencode:BACKEND"
+pi = "untether.runners.pi:BACKEND"
+gemini = "untether.runners.gemini:BACKEND"
+amp = "untether.runners.amp:BACKEND"
+
+[project.entry-points."untether.transport_backends"]
+telegram = "untether.telegram.backend:BACKEND"
+
+[project.entry-points."untether.command_backends"]
+claude_control = "untether.telegram.commands.claude_control:BACKEND"
+usage = "untether.telegram.commands.usage:BACKEND"
+planmode = "untether.telegram.commands.planmode:BACKEND"
+ping = "untether.telegram.commands.ping:BACKEND"
+export = "untether.telegram.commands.export:BACKEND"
+browse = "untether.telegram.commands.browse:BACKEND"
+restart = "untether.telegram.commands.restart:BACKEND"
+verbose = "untether.telegram.commands.verbose:BACKEND"
+config = "untether.telegram.commands.config:BACKEND"
+aq = "untether.telegram.commands.ask_question:BACKEND"
+stats = "untether.telegram.commands.stats:BACKEND"
+auth = "untether.telegram.commands.auth:BACKEND"
+threads = "untether.telegram.commands.threads:BACKEND"
+at = "untether.telegram.commands.at:BACKEND"
+health = "untether.telegram.commands.health:BACKEND"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "bandit>=1.8.0",
+    "mutmut>=3.4.0",
+    "pip-audit>=2.7.0",
+    "pytest>=9.0.3",
+    "pytest-anyio>=0.0.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.14.10",
+    "ty>=0.0.8",
+]
+docs = [
+    "mkdocstrings-python>=2.0.1",
+    "zensical>=0.0.15",
+]
+
+[tool.pytest.ini_options]
+addopts = ["--cov=untether", "--cov-branch", "--cov-report=term-missing", "--cov-fail-under=80"]
+testpaths = ["tests"]
+
+[tool.mutmut]
+paths_to_mutate = ["src/untether"]
+tests_dir = ["tests"]
+pytest_add_cli_args = ["-q", "--no-cov"]
+do_not_mutate = ["src/untether/cli/*"]
+
+[tool.ruff.lint]
+extend-select = [
+    "ASYNC",   # async/await best practices (anyio-aware)
+    "B",       # bugbear — common Python anti-patterns
+    "BLE001",  # bare except with noqa
+    "C4",      # comprehension improvements
+    "FA",      # future annotations consistency
+    "FLY",     # prefer f-strings over str.join on literals
+    "FURB",    # refurb — modern Python idioms
+    "I",       # isort — import sorting
+    "ISC",     # implicit string concatenation
+    "LOG",     # logging best practices
+    "PERF",    # performance anti-patterns
+    "PIE",     # miscellaneous lints (startswith/endswith tuples, etc.)
+    "PT",      # pytest style conventions
+    "RET",     # return statement consistency
+    "RUF",     # ruff-specific rules
+    "S110",    # try-except-pass (security)
+    "SIM",     # code simplification
+    "UP",      # pyupgrade — modernise syntax for target Python
+]
+ignore = [
+    "FLY002",  # static join to f-string — "\n\n".join([...]) is clearer for multi-paragraph text
+    "RET504",  # unnecessary assign before return — pipeline-style `text = ...; return text` is clearer
+    "RUF001",  # ambiguous unicode — intentional emoji in Telegram UI strings
+    "RUF005",  # collection concat — `list + [item]` is clearer than `[*list, item]` in some contexts
+    "RUF009",  # dataclass mutable default — false positives with dataclass(slots=True)
+    "PT018",   # pytest composite assertion — sometimes clearer as one assert
+    "RET505",  # superfluous else after return — sometimes aids readability
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "ASYNC109",  # timeout params in test fakes mirror production signatures
+    "ASYNC110",  # busy-wait polling acceptable in tests
+    "ASYNC251",  # time.sleep acceptable in tests for ordering
+    "PT006",     # parametrize names tuple vs list — not worth enforcing
+    "PT012",     # multiple statements in raises block — sometimes clearer
+    "RUF059",    # unused unpacked vars common in test fixture helpers
+    "S110",      # try-except-pass acceptable in test helpers
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["untether"]
+
+[tool.bandit]
+# Retained skips:
+#   B101 — asserts are used for type-narrowing and invariant checks
+#   B105 — "hardcoded password" false-positives on string literals like
+#          "--force" that aren't passwords
+#   B404 — "consider security of subprocess module"; Untether is a subprocess
+#          manager, flagging every `import subprocess` adds no signal
+# Removed in #202: B603/B607 global skips.  Each remaining subprocess call
+# site is now annotated inline with `# nosec` + justification, so new
+# subprocess usage is flagged by CI by default.
+skips = ["B101", "B105", "B404"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+exclude = ["scripts"]

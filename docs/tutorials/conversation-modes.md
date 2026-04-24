@@ -1,0 +1,134 @@
+# Conversation modes
+
+Untether can handle follow-up messages in two ways: **chat mode** (auto-resume) or **stateless** (reply-to-continue). Both work across all your devices — start a conversation on your phone, continue it from your laptop, or check in from [Telegram Web](https://web.telegram.org).
+
+During [onboarding](install.md), you chose a **workflow** (assistant, workspace, or handoff) that automatically configured this for you:
+
+| Workflow | Session mode | Topics | Resume lines |
+|----------|--------------|--------|--------------|
+| **assistant** | chat | off | hidden |
+| **workspace** | chat | on | hidden |
+| **handoff** | stateless | off | shown |
+
+This page explains what those settings mean and how to change them.
+
+## Chat mode (auto-resume)
+
+<img src="../assets/screenshots/chat-auto-resume.jpg" alt="Follow-up message auto-resumes the previous session without replying" width="360" loading="lazy" />
+
+**What it feels like:** a normal chat assistant.
+
+!!! user "You"
+    explain what this repo does
+
+!!! untether "Untether"
+    done · codex · 8s
+    ...
+
+!!! user "You"
+    now add tests
+
+Untether treats the second message as a continuation. If you want a clean slate, use:
+
+!!! user "You"
+    /new
+
+To pin a project or branch for the chat, use:
+
+!!! user "You"
+    /ctx set <project> [@branch]
+
+`/new` cancels any running task and clears the session, but keeps the bound context.
+
+Tip: set a default engine for this chat with `/agent set claude`.
+
+## Stateless (reply-to-continue)
+
+<img src="../assets/screenshots/stateless-reply-resume.jpg" alt="Stateless mode — user replying to a message with resume line" width="360" loading="lazy" />
+
+**What it feels like:** every message is independent until you reply.
+
+!!! user "You"
+    explain what this repo does
+
+!!! untether "Untether"
+    done · codex · 8s
+    ...
+    `codex resume abc123`
+
+To continue the same session, **reply** to a message with a resume line:
+
+!!! untether "Untether"
+    done · codex · 8s
+
+    !!! user "You"
+        now add tests
+
+## Changing your settings
+
+You can manually change these settings in your config file:
+
+=== "untether config"
+
+    ```sh
+    untether config set transports.telegram.session_mode "chat"
+    untether config set transports.telegram.show_resume_line false
+    ```
+
+=== "toml"
+
+    ```toml
+    [transports.telegram]
+    session_mode = "chat"      # "chat" or "stateless"
+    show_resume_line = false   # true or false
+    ```
+
+Or re-run onboarding to pick a different workflow:
+
+```sh
+untether --onboard
+```
+
+## Resume lines in chat mode
+
+If you enable chat mode (or topics), Untether can auto-resume, so you can hide resume lines for a cleaner chat.
+Disable them if you want a fully clean footer, or enable `show_resume_line` to keep reply-branching visible.
+
+If you prefer always-visible resume lines, set:
+
+=== "untether config"
+
+    ```sh
+    untether config set transports.telegram.show_resume_line true
+    ```
+
+=== "toml"
+
+    ```toml
+    [transports.telegram]
+    show_resume_line = true
+    ```
+
+## Reply-to-continue still works
+
+Even in chat mode, replying to a message with a resume line takes precedence and branches from that point.
+
+## Cross-environment resume
+
+Started a session in your terminal and left the house? Use `/continue` to pick it up from Telegram — no reply needed. Works with Claude, Codex, OpenCode, Pi, and Gemini.
+
+See the [cross-environment resume guide](../how-to/cross-environment-resume.md) for details.
+
+## Related
+
+- [Routing and sessions](../explanation/routing-and-sessions.md)
+- [Chat sessions](../how-to/chat-sessions.md)
+- [Cross-environment resume](../how-to/cross-environment-resume.md)
+- [Forum topics](../how-to/topics.md)
+- [Commands & directives](../reference/commands-and-directives.md)
+
+## Next
+
+Now that you know which mode you want, move on to your first run:
+
+[First run →](first-run.md)

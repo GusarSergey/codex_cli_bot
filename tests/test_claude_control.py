@@ -1,0 +1,2164 @@
+"""Tests for Claude Code control channel: request translation, response routing,
+registry lifecycle, auto-approve drain, and full tool-use lifecycle."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from unittest.mock import AsyncMock
+
+import anyio
+import pytest
+
+from untether.events import EventFactory
+from untether.model import ActionEvent, ResumeToken
+from untether.runners.claude import (
+    _ACTIVE_RUNNERS,
+    _DISCUSS_APPROVED,
+    _DISCUSS_COOLDOWN,
+    _HANDLED_REQUESTS,
+    _OUTLINE_PENDING,
+    _PLAN_EXIT_APPROVED,
+    _REQUEST_TO_INPUT,
+    _REQUEST_TO_SESSION,
+    _REQUEST_TO_TOOL_NAME,
+    _SESSION_STDIN,
+    DISCUSS_COOLDOWN_BASE_SECONDS,
+    ENGINE,
+    ClaudeRunner,
+    ClaudeStreamState,
+    _cleanup_session_registries,
+    check_discuss_cooldown,
+    clear_discuss_cooldown,
+    send_claude_control_response,
+    set_discuss_cooldown,
+    translate_claude_event,
+)
+from untether.schemas import claude as claude_schema
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _decode_event(payload: dict) -> claude_schema.StreamJsonMessage:
+    """Build a StreamJsonMessage from a minimal dict, filling in defaults."""
+    data = dict(payload)
+    data.setdefault("uuid", "uuid")
+    data.setdefault("session_id", "session")
+    match data.get("type"):
+        case "assistant":
+            message = dict(data.get("message", {}))
+            message.setdefault("role", "assistant")
+            message.setdefault("content", [])
+            message.setdefault("model", "claude")
+            data["message"] = message
+        case "user":
+            message = dict(data.get("message", {}))
+            message.setdefault("role", "user")
+            message.setdefault("content", [])
+            data["message"] = message
+    return claude_schema.decode_stream_json_line(json.dumps(data).encode())
+
+
+def _make_state_with_session(
+    session_id: str = "sess-1",
+) -> tuple[ClaudeStreamState, EventFactory]:
+    """Return a state whose factory already has a resume token set."""
+    state = ClaudeStreamState()
+    token = ResumeToken(engine=ENGINE, value=session_id)
+    state.factory.started(token, title="claude")
+    return state, state.factory
+
+
+# ---------------------------------------------------------------------------
+# Autouse fixture: clear global registries between tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_registries():
+    # Clear before and after each test — module-level registries can leak
+    # state from a prior module's first test if we only clear post-yield (#309).
+    from untether.telegram.commands.claude_control import _DISCUSS_FEEDBACK_REFS
+
+    def _wipe() -> None:
+        _ACTIVE_RUNNERS.clear()
+        _SESSION_STDIN.clear()
+        _REQUEST_TO_SESSION.clear()
+        _REQUEST_TO_INPUT.clear()
+        _HANDLED_REQUESTS.clear()
+        _DISCUSS_COOLDOWN.clear()
+        _PLAN_EXIT_APPROVED.clear()
+        _DISCUSS_FEEDBACK_REFS.clear()
+
+    _wipe()
+    yield
+    _wipe()
+
+
+# ===========================================================================
+# A. Control Request Translation
+# ===========================================================================
+
+
+def test_can_use_tool_produces_warning_with_inline_keyboard() -> None:
+    """ExitPlanMode CanUseTool request -> ActionEvent with kind='warning'
+    and inline_keyboard containing Approve/Deny buttons with request_id."""
+    state, factory = _make_state_with_session()
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert len(events) == 1
+    evt = events[0]
+    assert isinstance(evt, ActionEvent)
+    assert evt.action.kind == "warning"
+    assert evt.phase == "started"
+    assert "CanUseTool" in evt.action.title
+
+    kb = evt.action.detail["inline_keyboard"]
+    buttons = kb["buttons"]
+    assert len(buttons) == 2  # two rows for ExitPlanMode
+    assert len(buttons[0]) == 2  # Approve + Deny
+    assert buttons[0][0]["text"] == "✅ Approve"
+    assert "req-1" in buttons[0][0]["callback_data"]
+    assert buttons[0][1]["text"] == "❌ Deny"
+    assert "req-1" in buttons[0][1]["callback_data"]
+    # Second row: Outline Plan
+    assert len(buttons[1]) == 1
+    assert buttons[1][0]["text"] == "📋 Pause & Outline Plan"
+    assert "discuss" in buttons[1][0]["callback_data"]
+    assert "req-1" in buttons[1][0]["callback_data"]
+
+
+@pytest.mark.parametrize(
+    "subtype,extra_fields",
+    [
+        ("initialize", {"hooks": None}),
+        ("hook_callback", {"callback_id": "cb-1", "input": {}}),
+        ("mcp_message", {"server_name": "srv", "message": {}}),
+        ("rewind_files", {"user_message_id": "msg-1"}),
+        ("interrupt", {}),
+    ],
+)
+def test_auto_approve_types_add_to_queue(subtype: str, extra_fields: dict) -> None:
+    """Auto-approve request types produce no events and queue the request_id."""
+    state, factory = _make_state_with_session()
+    request = {"subtype": subtype, **extra_fields}
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": f"req-{subtype}",
+            "request": request,
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert events == []
+    assert f"req-{subtype}" in state.auto_approve_queue
+
+
+@pytest.mark.parametrize(
+    "subtype,extra_fields,expected_input",
+    [
+        ("initialize", {"hooks": None}, {}),
+        (
+            "hook_callback",
+            {"callback_id": "cb-1", "input": {"key": "val"}},
+            {"key": "val"},
+        ),
+        ("mcp_message", {"server_name": "srv", "message": {}}, {}),
+        ("rewind_files", {"user_message_id": "msg-1"}, {}),
+        ("interrupt", {}, {}),
+    ],
+)
+def test_auto_approve_types_register_input(
+    subtype: str, extra_fields: dict, expected_input: dict
+) -> None:
+    """Auto-approve types register input in _REQUEST_TO_INPUT for updatedInput."""
+    state, factory = _make_state_with_session()
+    request = {"subtype": subtype, **extra_fields}
+    req_id = f"req-input-{subtype}"
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": req_id,
+            "request": request,
+        }
+    )
+    translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert req_id in _REQUEST_TO_INPUT
+    assert _REQUEST_TO_INPUT[req_id] == expected_input
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "Task",
+        "Skill",
+        "ToolSearch",
+    ],
+)
+def test_non_exit_plan_mode_tools_auto_approved(tool_name: str) -> None:
+    """CanUseTool requests for tools other than ExitPlanMode are auto-approved."""
+    state, factory = _make_state_with_session()
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": f"req-auto-{tool_name}",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": tool_name,
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert events == []
+    assert f"req-auto-{tool_name}" in state.auto_approve_queue
+
+
+def test_exit_plan_mode_not_auto_approved() -> None:
+    """ExitPlanMode CanUseTool requests are NOT auto-approved (require user interaction)."""
+    state, factory = _make_state_with_session()
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-epm",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert len(events) == 1
+    assert isinstance(events[0], ActionEvent)
+    assert events[0].action.kind == "warning"
+    assert "req-epm" not in state.auto_approve_queue
+
+
+def test_request_to_session_populated() -> None:
+    """A CanUseTool control request (requiring approval) populates _REQUEST_TO_SESSION."""
+    state, factory = _make_state_with_session("sess-abc")
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-map",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert _REQUEST_TO_SESSION["req-map"] == "sess-abc"
+
+
+def test_request_to_input_populated() -> None:
+    """A CanUseTool control request (requiring approval) stores original tool input."""
+    state, factory = _make_state_with_session()
+    tool_input: dict[str, Any] = {}
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-inp",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": tool_input,
+            },
+        }
+    )
+    translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert _REQUEST_TO_INPUT["req-inp"] == tool_input
+
+
+# ===========================================================================
+# B. Control Response Routing
+# ===========================================================================
+
+
+@pytest.mark.anyio
+async def test_send_control_response_success() -> None:
+    """Registers runner + session + stdin, sends response, verifies cleanup."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-resp"
+
+    # Register runner and session stdin
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-resp"] = session_id
+    _REQUEST_TO_INPUT["req-resp"] = {"command": "ls"}
+
+    result = await send_claude_control_response("req-resp", approved=True)
+
+    assert result is True
+    # Verify JSON payload sent to stdin
+    fake_stdin.send.assert_awaited_once()
+    payload = json.loads(fake_stdin.send.call_args[0][0].decode())
+    assert payload["type"] == "control_response"
+    assert payload["response"]["request_id"] == "req-resp"
+    assert payload["response"]["response"]["behavior"] == "allow"
+    assert payload["response"]["response"]["updatedInput"] == {"command": "ls"}
+
+    # Cleanup: request removed from mapping, added to handled
+    assert "req-resp" not in _REQUEST_TO_SESSION
+    assert "req-resp" in _HANDLED_REQUESTS
+
+
+@pytest.mark.anyio
+async def test_duplicate_request_returns_true() -> None:
+    """Already-handled request_id returns True (duplicate callback)."""
+    _HANDLED_REQUESTS["req-dup"] = None
+    result = await send_claude_control_response("req-dup", approved=True)
+    assert result is True
+
+
+def test_handled_requests_evicts_oldest_lru() -> None:
+    """#197: _HANDLED_REQUESTS is an OrderedDict with LRU eviction at
+    _HANDLED_REQUESTS_MAX — no wholesale clear() that would open a window for
+    duplicate-callback misclassification."""
+    from untether.runners.claude import _HANDLED_REQUESTS_MAX
+
+    _HANDLED_REQUESTS.clear()
+    # Fill beyond the cap.
+    for i in range(_HANDLED_REQUESTS_MAX + 20):
+        _HANDLED_REQUESTS[f"req-{i}"] = None
+        _HANDLED_REQUESTS.move_to_end(f"req-{i}")
+        while len(_HANDLED_REQUESTS) > _HANDLED_REQUESTS_MAX:
+            _HANDLED_REQUESTS.popitem(last=False)
+
+    # Size is bounded.
+    assert len(_HANDLED_REQUESTS) == _HANDLED_REQUESTS_MAX
+    # Oldest entries evicted.
+    assert "req-0" not in _HANDLED_REQUESTS
+    assert "req-19" not in _HANDLED_REQUESTS
+    # Newest still present.
+    assert f"req-{_HANDLED_REQUESTS_MAX + 19}" in _HANDLED_REQUESTS
+    _HANDLED_REQUESTS.clear()
+
+
+@pytest.mark.anyio
+async def test_unknown_request_returns_false() -> None:
+    """Unknown request_id returns False."""
+    result = await send_claude_control_response("req-unknown", approved=True)
+    assert result is False
+
+
+@pytest.mark.anyio
+async def test_write_control_response_deny_format() -> None:
+    """Deny produces behavior='deny' with message."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-deny"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-deny"] = session_id
+    _REQUEST_TO_INPUT["req-deny"] = {"command": "rm -rf /"}
+
+    result = await send_claude_control_response("req-deny", approved=False)
+
+    assert result is True
+    payload = json.loads(fake_stdin.send.call_args[0][0].decode())
+    inner = payload["response"]["response"]
+    assert inner["behavior"] == "deny"
+    assert inner["message"] == "User denied"
+    # updatedInput should NOT be present on deny
+    assert "updatedInput" not in inner
+
+
+# ---------------------------------------------------------------------------
+# B2. Closed-pipe race condition (#61)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_write_control_response_returns_true_on_success() -> None:
+    """Happy path: write_control_response returns True."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-ok"
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-ok"] = session_id
+
+    result = await runner.write_control_response("req-ok", approved=True)
+    assert result is True
+
+
+@pytest.mark.anyio
+async def test_write_control_response_returns_false_on_closed_resource() -> None:
+    """ClosedResourceError returns False instead of raising."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-closed"
+    fake_stdin = AsyncMock()
+    fake_stdin.send.side_effect = anyio.ClosedResourceError()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-closed"] = session_id
+
+    result = await runner.write_control_response("req-closed", approved=True)
+    assert result is False
+
+
+@pytest.mark.anyio
+async def test_write_control_response_returns_false_on_oserror() -> None:
+    """OSError returns False instead of raising."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-os"
+    fake_stdin = AsyncMock()
+    fake_stdin.send.side_effect = OSError("Broken pipe")
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-os"] = session_id
+
+    result = await runner.write_control_response("req-os", approved=True)
+    assert result is False
+
+
+@pytest.mark.anyio
+async def test_send_control_response_returns_false_on_closed_pipe() -> None:
+    """End-to-end: broken stdin → send_claude_control_response returns False."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-e2e"
+    fake_stdin = AsyncMock()
+    fake_stdin.send.side_effect = anyio.ClosedResourceError()
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-e2e"] = session_id
+
+    result = await send_claude_control_response("req-e2e", approved=True)
+    assert result is False
+    # Cleanup still happens
+    assert "req-e2e" not in _REQUEST_TO_SESSION
+    assert "req-e2e" in _HANDLED_REQUESTS
+
+
+# ===========================================================================
+# C. Registry Lifecycle
+# ===========================================================================
+
+
+def test_session_stdin_different_entries() -> None:
+    """Two sessions get distinct stdin entries."""
+    fake_a = AsyncMock()
+    fake_b = AsyncMock()
+    _SESSION_STDIN["sess-a"] = fake_a
+    _SESSION_STDIN["sess-b"] = fake_b
+
+    assert _SESSION_STDIN["sess-a"] is fake_a
+    assert _SESSION_STDIN["sess-b"] is fake_b
+    assert _SESSION_STDIN["sess-a"] is not _SESSION_STDIN["sess-b"]
+
+
+def test_process_error_events_cleans_registries() -> None:
+    """process_error_events removes session from _ACTIVE_RUNNERS and _SESSION_STDIN."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-err"
+    token = ResumeToken(engine=ENGINE, value=session_id)
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    _SESSION_STDIN[session_id] = AsyncMock()
+
+    state = ClaudeStreamState()
+    runner.process_error_events(
+        1,
+        resume=token,
+        found_session=token,
+        state=state,
+    )
+
+    assert session_id not in _ACTIVE_RUNNERS
+    assert session_id not in _SESSION_STDIN
+
+
+def test_stream_end_events_cleans_registries() -> None:
+    """stream_end_events removes session from _ACTIVE_RUNNERS and _SESSION_STDIN."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-end"
+    token = ResumeToken(engine=ENGINE, value=session_id)
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    _SESSION_STDIN[session_id] = AsyncMock()
+
+    state = ClaudeStreamState()
+    runner.stream_end_events(
+        resume=token,
+        found_session=token,
+        state=state,
+    )
+
+    assert session_id not in _ACTIVE_RUNNERS
+    assert session_id not in _SESSION_STDIN
+
+
+# ---------------------------------------------------------------------------
+# C2. Cleanup includes cooldown, outline, and approval state (#93)
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_session_registries_clears_all_state() -> None:
+    """_cleanup_session_registries clears cooldown, outline, and approval state."""
+    from untether.telegram.commands.claude_control import _DISCUSS_FEEDBACK_REFS
+    from untether.transport import MessageRef
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-full-cleanup"
+
+    # Populate all registries
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    _SESSION_STDIN[session_id] = AsyncMock()
+    set_discuss_cooldown(session_id)
+    _DISCUSS_APPROVED.add(session_id)
+    _OUTLINE_PENDING.add(session_id)
+    _REQUEST_TO_SESSION["req-a"] = session_id
+    _REQUEST_TO_SESSION["req-b"] = session_id
+    _DISCUSS_FEEDBACK_REFS[session_id] = MessageRef(channel_id=1, message_id=1)
+
+    _cleanup_session_registries(session_id)
+
+    assert session_id not in _ACTIVE_RUNNERS
+    assert session_id not in _SESSION_STDIN
+    assert session_id not in _DISCUSS_COOLDOWN
+    assert session_id not in _DISCUSS_APPROVED
+    assert session_id not in _OUTLINE_PENDING
+    assert "req-a" not in _REQUEST_TO_SESSION
+    assert "req-b" not in _REQUEST_TO_SESSION
+    assert session_id not in _DISCUSS_FEEDBACK_REFS
+
+
+def test_cleanup_session_registries_idempotent() -> None:
+    """Calling _cleanup_session_registries twice does not raise."""
+    session_id = "sess-idempotent"
+    _cleanup_session_registries(session_id)
+    _cleanup_session_registries(session_id)
+    # No error raised
+
+
+def test_cleanup_preserves_other_sessions() -> None:
+    """_cleanup_session_registries only affects the specified session."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    keep_id = "sess-keep"
+    clean_id = "sess-clean"
+
+    _ACTIVE_RUNNERS[keep_id] = (runner, 0.0)
+    _ACTIVE_RUNNERS[clean_id] = (runner, 0.0)
+    _SESSION_STDIN[keep_id] = AsyncMock()
+    _SESSION_STDIN[clean_id] = AsyncMock()
+    _REQUEST_TO_SESSION["req-keep"] = keep_id
+    _REQUEST_TO_SESSION["req-clean"] = clean_id
+
+    _cleanup_session_registries(clean_id)
+
+    assert keep_id in _ACTIVE_RUNNERS
+    assert keep_id in _SESSION_STDIN
+    assert "req-keep" in _REQUEST_TO_SESSION
+    assert clean_id not in _ACTIVE_RUNNERS
+    assert "req-clean" not in _REQUEST_TO_SESSION
+
+    # Clean up remaining state
+    _cleanup_session_registries(keep_id)
+
+
+# ===========================================================================
+# D. Auto-approve Drain
+# ===========================================================================
+
+
+@pytest.mark.anyio
+async def test_drain_auto_approve_uses_provided_stdin() -> None:
+    """Drain writes to the provided stdin, not self._proc_stdin."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    runner._proc_stdin = AsyncMock(name="proc_stdin")  # should NOT be used
+    provided = AsyncMock(name="provided_stdin")
+
+    state = ClaudeStreamState()
+    state.auto_approve_queue.append("req-drain-1")
+
+    await runner._drain_auto_approve(state, stdin=provided)
+
+    provided.send.assert_awaited_once()
+    runner._proc_stdin.send.assert_not_awaited()  # type: ignore[union-attr]
+    assert state.auto_approve_queue == []
+
+
+@pytest.mark.anyio
+async def test_drain_auto_approve_falls_back_to_proc_stdin() -> None:
+    """Without explicit stdin, falls back to self._proc_stdin."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    runner._proc_stdin = AsyncMock(name="proc_stdin")
+
+    state = ClaudeStreamState()
+    state.auto_approve_queue.extend(["req-fb-1", "req-fb-2"])
+
+    await runner._drain_auto_approve(state)
+
+    assert runner._proc_stdin.send.await_count == 2  # type: ignore[union-attr]
+    assert state.auto_approve_queue == []
+
+
+# ===========================================================================
+# E. Full Lifecycle
+# ===========================================================================
+
+
+def test_control_action_lifecycle_tool_use_to_result() -> None:
+    """tool_use -> control_request -> tool_result: verifies last_tool_use_id,
+    control_action_for_tool mapping, and completion of both actions.
+    Uses ExitPlanMode since it's the only tool requiring interactive approval."""
+    state, factory = _make_state_with_session()
+
+    # Step 1: assistant message with tool_use
+    tool_use_evt = _decode_event(
+        {
+            "type": "assistant",
+            "message": {
+                "id": "msg-1",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_lifecycle",
+                        "name": "ExitPlanMode",
+                        "input": {},
+                    }
+                ],
+            },
+        }
+    )
+    events_1 = translate_claude_event(
+        tool_use_evt, title="claude", state=state, factory=factory
+    )
+    assert len(events_1) == 1
+    assert isinstance(events_1[0], ActionEvent)
+    assert events_1[0].phase == "started"
+    assert state.last_tool_use_id == "toolu_lifecycle"
+
+    # Step 2: control request (can_use_tool) — ExitPlanMode requires approval
+    control_evt = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-lifecycle",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events_2 = translate_claude_event(
+        control_evt, title="claude", state=state, factory=factory
+    )
+    assert len(events_2) == 1
+    assert isinstance(events_2[0], ActionEvent)
+    assert events_2[0].action.kind == "warning"
+
+    # Verify mapping
+    assert "toolu_lifecycle" in state.control_action_for_tool
+    control_action_id = state.control_action_for_tool["toolu_lifecycle"]
+
+    # Step 3: tool result
+    result_evt = _decode_event(
+        {
+            "type": "user",
+            "message": {
+                "id": "msg-2",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_lifecycle",
+                        "content": "plan approved",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+    )
+    events_3 = translate_claude_event(
+        result_evt, title="claude", state=state, factory=factory
+    )
+
+    # Should produce: tool result completion + control action completion
+    assert len(events_3) == 2
+    tool_result = events_3[0]
+    control_resolved = events_3[1]
+
+    assert isinstance(tool_result, ActionEvent)
+    assert tool_result.phase == "completed"
+    assert tool_result.action.id == "toolu_lifecycle"
+
+    assert isinstance(control_resolved, ActionEvent)
+    assert control_resolved.phase == "completed"
+    assert control_resolved.action.id == control_action_id
+    assert control_resolved.action.kind == "warning"
+    assert control_resolved.action.title == "Permission resolved"
+
+    # Mapping cleaned up
+    assert "toolu_lifecycle" not in state.control_action_for_tool
+
+
+# ===========================================================================
+# F. Discuss Action & Custom Deny Message
+# ===========================================================================
+
+
+@pytest.mark.anyio
+async def test_send_control_response_custom_deny_message() -> None:
+    """Custom deny_message is included in the control response payload."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-custom-deny"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-custom"] = session_id
+    _REQUEST_TO_INPUT["req-custom"] = {}
+
+    result = await send_claude_control_response(
+        "req-custom", approved=False, deny_message="Please outline the plan"
+    )
+
+    assert result is True
+    payload = json.loads(fake_stdin.send.call_args[0][0].decode())
+    inner = payload["response"]["response"]
+    assert inner["behavior"] == "deny"
+    assert inner["message"] == "Please outline the plan"
+
+
+@pytest.mark.anyio
+async def test_send_control_response_default_deny_message() -> None:
+    """Without custom deny_message, 'User denied' is used."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-default-deny"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-default"] = session_id
+    _REQUEST_TO_INPUT["req-default"] = {}
+
+    await send_claude_control_response("req-default", approved=False)
+
+    payload = json.loads(fake_stdin.send.call_args[0][0].decode())
+    inner = payload["response"]["response"]
+    assert inner["message"] == "User denied"
+
+
+# ===========================================================================
+# G. ClaudeControlCommand: early_answer_toast & discuss handler
+# ===========================================================================
+
+
+def test_early_answer_toast_values() -> None:
+    """early_answer_toast returns correct toast for each action."""
+    from untether.telegram.commands.claude_control import ClaudeControlCommand
+
+    cmd = ClaudeControlCommand()
+    assert cmd.early_answer_toast("approve:req-1") == "Approved"
+    assert cmd.early_answer_toast("deny:req-1") == "Denied"
+    assert cmd.early_answer_toast("discuss:req-1") == "Outlining plan..."
+    assert cmd.early_answer_toast("chat:req-1") == "Let's discuss..."
+    assert cmd.early_answer_toast("unknown:req-1") is None
+    assert cmd.early_answer_toast("") is None
+
+
+@pytest.mark.anyio
+async def test_discuss_action_sends_deny_with_custom_message() -> None:
+    """Discuss action sends a deny with the outline-plan deny message."""
+    from untether.telegram.commands.claude_control import (
+        _DISCUSS_DENY_MESSAGE,
+        _DISCUSS_FEEDBACK_REFS,
+        ClaudeControlCommand,
+    )
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-discuss"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-discuss"] = session_id
+    _REQUEST_TO_INPUT["req-discuss"] = {}
+
+    # Build a minimal CommandContext with a fake executor
+    from untether.commands import CommandContext
+    from untether.transport import MessageRef
+
+    fake_executor = AsyncMock()
+    sent_ref = MessageRef(channel_id=123, message_id=99)
+    fake_executor.send = AsyncMock(return_value=sent_ref)
+
+    ctx = CommandContext(
+        command="claude_control",
+        text="claude_control:discuss:req-discuss",
+        args_text="discuss:req-discuss",
+        args=("discuss:req-discuss",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config=None,  # type: ignore[arg-type]
+        runtime=None,  # type: ignore[arg-type]
+        executor=fake_executor,
+    )
+
+    cmd = ClaudeControlCommand()
+    result = await cmd.handle(ctx)
+
+    # Handler sends directly and returns None
+    assert result is None
+    fake_executor.send.assert_called_once()
+    sent_text = fake_executor.send.call_args[0][0]
+    assert "outline" in sent_text.lower()
+
+    # Verify the discuss feedback ref was stored for later editing
+    assert session_id in _DISCUSS_FEEDBACK_REFS
+    assert _DISCUSS_FEEDBACK_REFS[session_id] == sent_ref
+
+    # Verify the stdin payload
+    payload = json.loads(fake_stdin.send.call_args[0][0].decode())
+    inner = payload["response"]["response"]
+    assert inner["behavior"] == "deny"
+    assert inner["message"] == _DISCUSS_DENY_MESSAGE
+
+
+# ===========================================================================
+# H. Discuss Cooldown / Rate-Limiting
+# ===========================================================================
+
+
+def test_set_discuss_cooldown_creates_entry() -> None:
+    """set_discuss_cooldown creates a cooldown entry with count=1."""
+    set_discuss_cooldown("sess-cd-1")
+    assert "sess-cd-1" in _DISCUSS_COOLDOWN
+    _, count = _DISCUSS_COOLDOWN["sess-cd-1"]
+    assert count == 1
+
+
+def test_set_discuss_cooldown_increments_count() -> None:
+    """Repeated calls increment the deny count."""
+    set_discuss_cooldown("sess-cd-2")
+    set_discuss_cooldown("sess-cd-2")
+    set_discuss_cooldown("sess-cd-2")
+    _, count = _DISCUSS_COOLDOWN["sess-cd-2"]
+    assert count == 3
+
+
+def test_check_discuss_cooldown_returns_escalation_within_window() -> None:
+    """check_discuss_cooldown returns escalation message within the cooldown window."""
+    set_discuss_cooldown("sess-cd-3")
+    result = check_discuss_cooldown("sess-cd-3")
+    assert result is not None
+    assert "REJECTED" in result
+    assert "ExitPlanMode" in result
+
+
+def test_check_discuss_cooldown_returns_none_when_not_set() -> None:
+    """check_discuss_cooldown returns None for unknown sessions."""
+    result = check_discuss_cooldown("sess-unknown")
+    assert result is None
+
+
+def test_check_discuss_cooldown_returns_none_after_expiry() -> None:
+    """check_discuss_cooldown returns None after the cooldown expires,
+    but preserves the count with zeroed timestamp for progressive escalation."""
+    import time as _time
+
+    set_discuss_cooldown("sess-cd-4")
+    # Manually backdate the timestamp
+    _, count = _DISCUSS_COOLDOWN["sess-cd-4"]
+    _DISCUSS_COOLDOWN["sess-cd-4"] = (
+        _time.time() - DISCUSS_COOLDOWN_BASE_SECONDS - 1,
+        count,
+    )
+
+    result = check_discuss_cooldown("sess-cd-4")
+    assert result is None
+    # Entry preserved with zeroed timestamp so next click escalates further
+    assert "sess-cd-4" in _DISCUSS_COOLDOWN
+    ts, preserved_count = _DISCUSS_COOLDOWN["sess-cd-4"]
+    assert ts == 0.0
+    assert preserved_count == count
+
+
+def test_clear_discuss_cooldown_removes_entry() -> None:
+    """clear_discuss_cooldown removes the cooldown entry."""
+    set_discuss_cooldown("sess-cd-5")
+    assert "sess-cd-5" in _DISCUSS_COOLDOWN
+    clear_discuss_cooldown("sess-cd-5")
+    assert "sess-cd-5" not in _DISCUSS_COOLDOWN
+
+
+def test_clear_discuss_cooldown_noop_for_unknown() -> None:
+    """clear_discuss_cooldown is a no-op for unknown sessions."""
+    clear_discuss_cooldown("sess-nonexistent")  # Should not raise
+
+
+def test_exit_plan_mode_auto_denied_during_cooldown() -> None:
+    """ExitPlanMode request during discuss cooldown queues an auto-deny
+    and returns a synthetic ActionEvent with Approve/Deny buttons."""
+    state, factory = _make_state_with_session("sess-cooldown")
+    set_discuss_cooldown("sess-cooldown")
+
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-cd-deny",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert len(state.auto_deny_queue) == 1
+    assert state.auto_deny_queue[0][0] == "req-cd-deny"
+    # Synthetic Approve/Deny buttons returned as ActionEvent
+    assert len(events) == 1
+    evt = events[0]
+    assert isinstance(evt, ActionEvent)
+    assert evt.action.kind == "warning"
+    assert "approve to proceed" in evt.action.title.lower()
+    assert evt.action.detail["request_id"] == "da:sess-cooldown"
+    buttons = evt.action.detail["inline_keyboard"]["buttons"]
+    assert len(buttons) == 2  # [Approve + Deny], [Let's discuss]
+    assert len(buttons[0]) == 2
+    assert "Approve" in buttons[0][0]["text"]  # "✅ Approve Plan"
+    assert buttons[1][0]["text"] == "💬 Let's discuss"
+
+
+def test_exit_plan_mode_blocked_after_cooldown_expires_without_outline() -> None:
+    """ExitPlanMode after cooldown expires but no outline written is still blocked."""
+    import time as _time
+
+    state, factory = _make_state_with_session("sess-cd-expired")
+    set_discuss_cooldown("sess-cd-expired")
+    # Backdate to expire
+    _, count = _DISCUSS_COOLDOWN["sess-cd-expired"]
+    _DISCUSS_COOLDOWN["sess-cd-expired"] = (
+        _time.time() - DISCUSS_COOLDOWN_BASE_SECONDS - 1,
+        count,
+    )
+
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-cd-ok",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    # Outline guard blocks ExitPlanMode — auto-denied with escalation
+    assert len(state.auto_deny_queue) == 1
+    assert "REJECTED" in state.auto_deny_queue[0][1]
+
+
+def test_exit_plan_mode_after_cooldown_expires_with_outline_shows_synthetic_buttons() -> (
+    None
+):
+    """ExitPlanMode after cooldown expires WITH outline written shows synthetic 2-button flow.
+
+    Regression test for #114: previously this fell through to the normal
+    3-button flow (Approve/Deny/Pause & Outline), confusing users who had
+    already outlined. Now it correctly enters the synthetic 2-button path.
+    """
+    import time as _time
+
+    state, factory = _make_state_with_session("sess-cd-outline")
+    set_discuss_cooldown("sess-cd-outline")
+    # Backdate to expire
+    _, count = _DISCUSS_COOLDOWN["sess-cd-outline"]
+    _DISCUSS_COOLDOWN["sess-cd-outline"] = (
+        _time.time() - DISCUSS_COOLDOWN_BASE_SECONDS - 1,
+        count,
+    )
+    # Simulate outline written
+    state.max_text_len_since_cooldown = 300
+
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-cd-outline",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    # Should hold request open and show synthetic Approve/Deny buttons (#114 fix)
+    assert len(state.auto_deny_queue) == 0
+    assert "req-cd-outline" in state.pending_control_requests
+    assert len(events) == 1
+    assert isinstance(events[0], ActionEvent)
+    detail = events[0].action.detail
+    assert detail["request_type"] == "DiscussApproval"
+    buttons = detail["inline_keyboard"]["buttons"]
+    assert len(buttons) == 2  # [Approve + Deny], [Let's discuss]
+    assert len(buttons[0]) == 2
+    assert buttons[0][0]["text"] == "✅ Approve Plan"
+    assert buttons[0][1]["text"] == "❌ Deny"
+    # Outline-ready uses real request_id (not da: prefix)
+    assert buttons[0][0]["callback_data"] == "claude_control:approve:req-cd-outline"
+    assert buttons[1][0]["text"] == "💬 Let's discuss"
+
+
+@pytest.mark.anyio
+async def test_drain_auto_deny_sends_deny_response() -> None:
+    """_drain_auto_deny writes deny payloads to stdin and clears the queue."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    provided = AsyncMock(name="provided_stdin")
+
+    state = ClaudeStreamState()
+    state.auto_deny_queue.append(("req-ad-1", "Test escalation message"))
+
+    await runner._drain_auto_deny(state, stdin=provided)
+
+    provided.send.assert_awaited_once()
+    payload = json.loads(provided.send.call_args[0][0].decode())
+    assert payload["type"] == "control_response"
+    assert payload["response"]["request_id"] == "req-ad-1"
+    assert payload["response"]["response"]["behavior"] == "deny"
+    assert payload["response"]["response"]["message"] == "Test escalation message"
+    assert state.auto_deny_queue == []
+
+
+@pytest.mark.anyio
+async def test_drain_auto_deny_multiple_items() -> None:
+    """_drain_auto_deny processes all queued items."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    provided = AsyncMock(name="provided_stdin")
+
+    state = ClaudeStreamState()
+    state.auto_deny_queue.append(("req-ad-2", "msg-2"))
+    state.auto_deny_queue.append(("req-ad-3", "msg-3"))
+
+    await runner._drain_auto_deny(state, stdin=provided)
+
+    assert provided.send.await_count == 2
+    assert state.auto_deny_queue == []
+
+
+@pytest.mark.anyio
+async def test_discuss_handler_sets_cooldown() -> None:
+    """Discuss action sets the discuss cooldown for the session."""
+    from untether.telegram.commands.claude_control import ClaudeControlCommand
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-discuss-cd"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-discuss-cd"] = session_id
+    _REQUEST_TO_INPUT["req-discuss-cd"] = {}
+
+    from untether.commands import CommandContext
+    from untether.transport import MessageRef
+
+    ctx = CommandContext(
+        command="claude_control",
+        text="claude_control:discuss:req-discuss-cd",
+        args_text="discuss:req-discuss-cd",
+        args=("discuss:req-discuss-cd",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config=None,  # type: ignore[arg-type]
+        runtime=None,  # type: ignore[arg-type]
+        executor=AsyncMock(send=AsyncMock(return_value=None)),
+    )
+
+    cmd = ClaudeControlCommand()
+    await cmd.handle(ctx)
+
+    # Cooldown should be set for the session
+    assert session_id in _DISCUSS_COOLDOWN
+
+
+@pytest.mark.anyio
+async def test_chat_action_hold_open_sends_deny() -> None:
+    """Chat action on hold-open request sends deny with chat message."""
+    from untether.telegram.commands.claude_control import ClaudeControlCommand
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-chat-hold"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-chat"] = session_id
+    _REQUEST_TO_INPUT["req-chat"] = {}
+    set_discuss_cooldown(session_id)
+    _OUTLINE_PENDING.add(session_id)
+
+    from untether.commands import CommandContext
+    from untether.transport import MessageRef
+
+    ctx = CommandContext(
+        command="claude_control",
+        text="claude_control:chat:req-chat",
+        args_text="chat:req-chat",
+        args=("chat:req-chat",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config=None,  # type: ignore[arg-type]
+        runtime=None,  # type: ignore[arg-type]
+        executor=AsyncMock(send=AsyncMock(return_value=None)),
+    )
+
+    cmd = ClaudeControlCommand()
+    result = await cmd.handle(ctx)
+
+    # Should send deny response with chat deny message
+    import json
+
+    fake_stdin.send.assert_awaited_once()
+    payload = json.loads(fake_stdin.send.call_args[0][0].decode())
+    inner = payload["response"]["response"]
+    assert inner["behavior"] == "deny"
+    assert "discuss" in inner["message"].lower()
+
+    # Should clear cooldown and outline_pending
+    assert session_id not in _DISCUSS_COOLDOWN
+    assert session_id not in _OUTLINE_PENDING
+
+    # Result should mention discuss
+    assert result is not None
+    assert "discuss" in result.text.lower()
+
+
+@pytest.mark.anyio
+async def test_approve_handler_clears_cooldown() -> None:
+    """Approve action clears any discuss cooldown for the session."""
+    from untether.telegram.commands.claude_control import ClaudeControlCommand
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-approve-cd"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-approve-cd"] = session_id
+    _REQUEST_TO_INPUT["req-approve-cd"] = {}
+
+    # Pre-set a cooldown
+    set_discuss_cooldown(session_id)
+    assert session_id in _DISCUSS_COOLDOWN
+
+    from untether.commands import CommandContext
+    from untether.transport import MessageRef
+
+    ctx = CommandContext(
+        command="claude_control",
+        text="claude_control:approve:req-approve-cd",
+        args_text="approve:req-approve-cd",
+        args=("approve:req-approve-cd",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config=None,  # type: ignore[arg-type]
+        runtime=None,  # type: ignore[arg-type]
+        executor=None,  # type: ignore[arg-type]
+    )
+
+    cmd = ClaudeControlCommand()
+    await cmd.handle(ctx)
+
+    # Cooldown should be cleared
+    assert session_id not in _DISCUSS_COOLDOWN
+
+
+# ===========================================================================
+# I. Progressive Cooldown Timing
+# ===========================================================================
+
+
+def test_progressive_cooldown_increases_with_count() -> None:
+    """Cooldown duration increases with each discuss click: 30s, 60s, 90s, 120s."""
+    from untether.runners.claude import _cooldown_seconds
+
+    assert _cooldown_seconds(1) == 30.0
+    assert _cooldown_seconds(2) == 60.0
+    assert _cooldown_seconds(3) == 90.0
+    assert _cooldown_seconds(4) == 120.0
+    # Capped at 120s
+    assert _cooldown_seconds(5) == 120.0
+    assert _cooldown_seconds(10) == 120.0
+
+
+def test_progressive_cooldown_escalation_message_content() -> None:
+    """Escalation message tells Claude Code to wait for button approval."""
+    set_discuss_cooldown("sess-prog-1")
+    set_discuss_cooldown("sess-prog-1")  # count=2 -> 60s
+
+    msg = check_discuss_cooldown("sess-prog-1")
+    assert msg is not None
+    assert "REJECTED" in msg
+    assert "ExitPlanMode" in msg
+
+
+def test_progressive_cooldown_count_preserved_after_expiry() -> None:
+    """After cooldown expires, count is preserved so next click escalates."""
+    import time as _time
+
+    set_discuss_cooldown("sess-prog-2")  # count=1
+    # Expire the cooldown
+    _, count = _DISCUSS_COOLDOWN["sess-prog-2"]
+    _DISCUSS_COOLDOWN["sess-prog-2"] = (
+        _time.time() - DISCUSS_COOLDOWN_BASE_SECONDS - 1,
+        count,
+    )
+    check_discuss_cooldown("sess-prog-2")  # returns None, preserves count
+
+    # Next click should be count=2 (60s cooldown)
+    set_discuss_cooldown("sess-prog-2")
+    _, new_count = _DISCUSS_COOLDOWN["sess-prog-2"]
+    assert new_count == 2
+
+    msg = check_discuss_cooldown("sess-prog-2")
+    assert msg is not None
+    assert "REJECTED" in msg
+
+
+# ===========================================================================
+# J. Auto-approve ExitPlanMode in "auto" permission mode
+# ===========================================================================
+
+
+def test_exit_plan_mode_auto_approved_in_auto_mode() -> None:
+    """ExitPlanMode is auto-approved when auto_approve_exit_plan_mode is True."""
+    state, factory = _make_state_with_session()
+    state.auto_approve_exit_plan_mode = True
+
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-auto-epm",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert events == []
+    assert "req-auto-epm" in state.auto_approve_queue
+
+
+def test_exit_plan_mode_not_auto_approved_in_plan_mode() -> None:
+    """ExitPlanMode still requires approval when auto_approve_exit_plan_mode is False."""
+    state, factory = _make_state_with_session()
+    state.auto_approve_exit_plan_mode = False
+
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-plan-epm",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert len(events) == 1
+    assert isinstance(events[0], ActionEvent)
+    assert events[0].action.kind == "warning"
+    assert "req-plan-epm" not in state.auto_approve_queue
+
+
+def test_exit_plan_mode_auto_mode_skips_cooldown() -> None:
+    """Auto mode bypasses discuss cooldown — auto-approves even during cooldown."""
+    state, factory = _make_state_with_session("sess-auto-cd")
+    state.auto_approve_exit_plan_mode = True
+
+    # Set a discuss cooldown for this session
+    set_discuss_cooldown("sess-auto-cd")
+
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-auto-cd",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    # Should be auto-approved, not auto-denied by cooldown
+    assert events == []
+    assert "req-auto-cd" in state.auto_approve_queue
+    assert state.auto_deny_queue == []
+
+
+# ---------------------------------------------------------------------------
+# Timeout auto-deny (prevents hanging — see takopi #215)
+# ---------------------------------------------------------------------------
+
+
+def test_expired_control_request_queues_auto_deny() -> None:
+    """Expired control requests should be auto-denied, not just cleaned up.
+
+    Without sending a deny response, the subprocess hangs indefinitely
+    waiting for a control_response that never comes.
+    See: https://github.com/banteg/takopi/issues/215
+    """
+    import time as _time
+
+    state, factory = _make_state_with_session("sess-timeout")
+
+    # AskUserQuestion requires approval (not auto-approved), so it goes to pending
+    old_event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-old",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "input": {"question": "Which database?"},
+            },
+        }
+    )
+    translate_claude_event(old_event, title="claude", state=state, factory=factory)
+
+    # Verify it was registered as pending
+    assert "req-old" in state.pending_control_requests
+
+    # Backdate the request to be older than the 5-minute timeout
+    evt_data, _ = state.pending_control_requests["req-old"]
+    state.pending_control_requests["req-old"] = (evt_data, _time.time() - 301.0)
+
+    # Trigger a NEW control request — the cleanup runs when processing new requests
+    new_event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-new",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "input": {"question": "Which framework?"},
+            },
+        }
+    )
+    translate_claude_event(new_event, title="claude", state=state, factory=factory)
+
+    # The expired request should have been removed from pending
+    assert "req-old" not in state.pending_control_requests
+
+    # CRITICAL: It should have been queued for auto-deny (not just discarded)
+    deny_ids = [rid for rid, _ in state.auto_deny_queue]
+    assert "req-old" in deny_ids, (
+        "Expired request must be auto-denied to unblock subprocess"
+    )
+
+    # The new request should still be pending
+    assert "req-new" in state.pending_control_requests
+
+
+def test_handled_request_not_auto_denied_on_expiry() -> None:
+    """Requests already handled via Telegram callback must NOT be auto-denied.
+
+    When send_claude_control_response() handles a request, it adds it to
+    _HANDLED_REQUESTS but can't clean up state.pending_control_requests.
+    The reconciliation in translate() should catch this and prevent the
+    5-minute expiry from sending a duplicate deny.
+    See: https://github.com/littlebearapps/untether/issues/229
+    """
+    import time as _time
+
+    state, factory = _make_state_with_session("sess-229")
+
+    # Create and register a control request
+    old_event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-handled",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    translate_claude_event(old_event, title="claude", state=state, factory=factory)
+    assert "req-handled" in state.pending_control_requests
+
+    # Simulate what send_claude_control_response does: mark as handled
+    # but leave it in pending_control_requests (the bug scenario)
+    _HANDLED_REQUESTS["req-handled"] = None
+    _REQUEST_TO_SESSION.pop("req-handled", None)
+
+    # Backdate it past the 5-minute timeout
+    evt_data, _ = state.pending_control_requests["req-handled"]
+    state.pending_control_requests["req-handled"] = (evt_data, _time.time() - 301.0)
+
+    # Trigger a new control request — reconciliation should run
+    new_event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-next",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(
+        new_event, title="claude", state=state, factory=factory
+    )
+
+    # The handled request should be removed from pending (reconciled)
+    assert "req-handled" not in state.pending_control_requests
+
+    # CRITICAL: It must NOT be in the auto_deny_queue
+    deny_ids = [rid for rid, _ in state.auto_deny_queue]
+    assert "req-handled" not in deny_ids, (
+        "Already-handled request must not be auto-denied (#229)"
+    )
+
+    # Should have emitted action_completed for the old keyboard + action_started for new
+    action_completed = [
+        e for e in events if isinstance(e, ActionEvent) and e.phase == "completed"
+    ]
+    assert len(action_completed) == 1
+    assert action_completed[0].action.title == "Permission resolved"
+
+
+def test_reconciliation_emits_action_completed_for_stale_keyboard() -> None:
+    """Reconciliation should emit action_completed to clear stale inline keyboards.
+
+    When a control request is handled via callback, the action_started event's
+    inline keyboard persists on the progress message. Reconciliation emits
+    action_completed to signal the progress renderer to remove the keyboard.
+    See: https://github.com/littlebearapps/untether/issues/229
+    """
+    state, factory = _make_state_with_session("sess-keyboard")
+
+    # Create a control request (this generates an action_started with keyboard)
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-kb",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    started_events = translate_claude_event(
+        event, title="claude", state=state, factory=factory
+    )
+    assert len(started_events) == 1
+    action_id = started_events[0].action.id
+
+    # Verify the request_to_action mapping was created
+    assert "req-kb" in state.request_to_action
+    assert state.request_to_action["req-kb"] == action_id
+
+    # Simulate callback handling
+    _HANDLED_REQUESTS["req-kb"] = None
+
+    # Trigger another control request to run reconciliation
+    new_event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-kb-2",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": {},
+            },
+        }
+    )
+    events = translate_claude_event(
+        new_event, title="claude", state=state, factory=factory
+    )
+
+    # Should include action_completed for the old action + action_started for new
+    completed = [
+        e for e in events if isinstance(e, ActionEvent) and e.phase == "completed"
+    ]
+    started = [e for e in events if isinstance(e, ActionEvent) and e.phase == "started"]
+    assert len(completed) == 1
+    assert completed[0].action.id == action_id
+    assert len(started) == 1
+
+    # Mapping should be cleaned up
+    assert "req-kb" not in state.request_to_action
+    assert "req-kb" not in state.pending_control_requests
+
+
+# ── Diff preview gate tests ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("tool_name", ["Edit", "Write", "Bash"])
+def test_diff_preview_enabled_skips_auto_approve(tool_name: str) -> None:
+    """When diff_preview=True, Edit/Write/Bash are NOT auto-approved."""
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    state, factory = _make_state_with_session()
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": f"req-dp-{tool_name}",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": tool_name,
+                "input": {"command": "ls"}
+                if tool_name == "Bash"
+                else {"file_path": "/tmp/x", "old_string": "a", "new_string": "b"},
+            },
+        }
+    )
+    with apply_run_options(EngineRunOptions(diff_preview=True)):
+        events = translate_claude_event(
+            event, title="claude", state=state, factory=factory
+        )
+
+    # Should produce an ActionEvent (not be auto-approved)
+    assert f"req-dp-{tool_name}" not in state.auto_approve_queue
+    assert len(events) >= 1
+    assert isinstance(events[0], ActionEvent)
+
+
+@pytest.mark.parametrize("tool_name", ["Edit", "Write", "Bash"])
+def test_diff_preview_disabled_still_auto_approves(tool_name: str) -> None:
+    """When diff_preview=False, Edit/Write/Bash are auto-approved as normal."""
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    state, factory = _make_state_with_session()
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": f"req-nodp-{tool_name}",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": tool_name,
+                "input": {},
+            },
+        }
+    )
+    with apply_run_options(EngineRunOptions(diff_preview=False)):
+        events = translate_claude_event(
+            event, title="claude", state=state, factory=factory
+        )
+
+    assert events == []
+    assert f"req-nodp-{tool_name}" in state.auto_approve_queue
+
+
+@pytest.mark.parametrize("tool_name", ["Edit", "Write", "Bash"])
+def test_diff_preview_default_auto_approves(tool_name: str) -> None:
+    """When diff_preview=None (default), Edit/Write/Bash are auto-approved."""
+    state, factory = _make_state_with_session()
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": f"req-def-{tool_name}",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": tool_name,
+                "input": {},
+            },
+        }
+    )
+    # No run_options set at all
+    events = translate_claude_event(event, title="claude", state=state, factory=factory)
+
+    assert events == []
+    assert f"req-def-{tool_name}" in state.auto_approve_queue
+
+
+@pytest.mark.parametrize("tool_name", ["Read", "Glob", "Grep", "WebFetch"])
+def test_diff_preview_enabled_non_previewable_still_auto_approved(
+    tool_name: str,
+) -> None:
+    """When diff_preview=True, non-previewable tools are still auto-approved."""
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    state, factory = _make_state_with_session()
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": f"req-np-{tool_name}",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": tool_name,
+                "input": {},
+            },
+        }
+    )
+    with apply_run_options(EngineRunOptions(diff_preview=True)):
+        events = translate_claude_event(
+            event, title="claude", state=state, factory=factory
+        )
+
+    assert events == []
+    assert f"req-np-{tool_name}" in state.auto_approve_queue
+
+
+@pytest.mark.parametrize("tool_name", ["Edit", "Write", "Bash"])
+def test_diff_preview_bypassed_after_plan_exit_approved(tool_name: str) -> None:
+    """After ExitPlanMode is approved, diff_preview tools auto-approve (#283)."""
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    state, factory = _make_state_with_session()
+    session_id = factory.resume.value
+    # Simulate plan exit approval
+    _PLAN_EXIT_APPROVED.add(session_id)
+
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": f"req-pea-{tool_name}",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": tool_name,
+                "input": {},
+            },
+        }
+    )
+    with apply_run_options(EngineRunOptions(diff_preview=True)):
+        events = translate_claude_event(
+            event, title="claude", state=state, factory=factory
+        )
+
+    # Should be auto-approved despite diff_preview=True
+    assert events == []
+    assert f"req-pea-{tool_name}" in state.auto_approve_queue
+
+
+def test_diff_preview_not_bypassed_without_plan_exit() -> None:
+    """Without ExitPlanMode approval, diff_preview gate still applies (#283)."""
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    state, factory = _make_state_with_session()
+    # _PLAN_EXIT_APPROVED is empty — no plan exit approved
+
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-nopea",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Edit",
+                "input": {"file_path": "/tmp/x", "old_string": "a", "new_string": "b"},
+            },
+        }
+    )
+    with apply_run_options(EngineRunOptions(diff_preview=True)):
+        events = translate_claude_event(
+            event, title="claude", state=state, factory=factory
+        )
+
+    # Should NOT be auto-approved — diff_preview gate still active
+    assert "req-nopea" not in state.auto_approve_queue
+    assert len(events) >= 1
+
+
+def test_plan_exit_approved_cleaned_up_on_session_end() -> None:
+    """_PLAN_EXIT_APPROVED is cleaned up when session ends (#283)."""
+    session_id = "sess-cleanup-283"
+    _PLAN_EXIT_APPROVED.add(session_id)
+    assert session_id in _PLAN_EXIT_APPROVED
+
+    _cleanup_session_registries(session_id)
+    assert session_id not in _PLAN_EXIT_APPROVED
+
+
+# ---------------------------------------------------------------------------
+# #369 — plain Approve on diff_preview tools must populate _PLAN_EXIT_APPROVED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool_name", ["Edit", "Write", "Bash", "ExitPlanMode"])
+@pytest.mark.anyio
+async def test_approve_populates_plan_exit_approved_for_diff_tools(
+    tool_name: str,
+) -> None:
+    """Plain Approve on any diff_preview tool or ExitPlanMode populates
+    _PLAN_EXIT_APPROVED so subsequent Edits auto-approve (#369)."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = f"sess-369-{tool_name}"
+    request_id = f"req-369-{tool_name}"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    _SESSION_STDIN[session_id] = AsyncMock()
+    _REQUEST_TO_SESSION[request_id] = session_id
+    _REQUEST_TO_INPUT[request_id] = {}
+    _REQUEST_TO_TOOL_NAME[request_id] = tool_name
+
+    ok = await runner.write_control_response(request_id, approved=True)
+    assert ok is True
+    assert session_id in _PLAN_EXIT_APPROVED
+
+
+@pytest.mark.anyio
+async def test_deny_does_not_populate_plan_exit_approved() -> None:
+    """Deny click must NOT populate _PLAN_EXIT_APPROVED (#369)."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-369-deny"
+    request_id = "req-369-deny"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    _SESSION_STDIN[session_id] = AsyncMock()
+    _REQUEST_TO_SESSION[request_id] = session_id
+    _REQUEST_TO_INPUT[request_id] = {}
+    _REQUEST_TO_TOOL_NAME[request_id] = "Edit"
+
+    await runner.write_control_response(request_id, approved=False, deny_message="nope")
+    assert session_id not in _PLAN_EXIT_APPROVED
+
+
+@pytest.mark.anyio
+async def test_approve_non_diff_tool_does_not_populate() -> None:
+    """Approving a non-diff non-ExitPlanMode tool must NOT populate the
+    bypass set (e.g., AskUserQuestion answers don't imply code review) (#369)."""
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-369-aq"
+    request_id = "req-369-aq"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    _SESSION_STDIN[session_id] = AsyncMock()
+    _REQUEST_TO_SESSION[request_id] = session_id
+    _REQUEST_TO_INPUT[request_id] = {}
+    _REQUEST_TO_TOOL_NAME[request_id] = "AskUserQuestion"
+
+    await runner.write_control_response(request_id, approved=True)
+    assert session_id not in _PLAN_EXIT_APPROVED
+
+
+def test_diff_preview_edit_shows_diff_text() -> None:
+    """When diff_preview=True, Edit approval message contains diff text."""
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    state, factory = _make_state_with_session()
+    event = _decode_event(
+        {
+            "type": "control_request",
+            "request_id": "req-diff-edit",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Edit",
+                "input": {
+                    "file_path": "/tmp/test.py",
+                    "old_string": "old_value",
+                    "new_string": "new_value",
+                },
+            },
+        }
+    )
+    with apply_run_options(EngineRunOptions(diff_preview=True)):
+        events = translate_claude_event(
+            event, title="claude", state=state, factory=factory
+        )
+
+    assert len(events) >= 1
+    action_event = events[0]
+    assert isinstance(action_event, ActionEvent)
+    # The action title should contain diff markers
+    assert "- old_value" in action_event.action.title
+    assert "+ new_value" in action_event.action.title
+
+
+# ===========================================================================
+# Q. ExitPlanMode-specific deny message
+# ===========================================================================
+
+
+@pytest.mark.anyio
+async def test_deny_exit_plan_mode_uses_specific_message() -> None:
+    """Denying ExitPlanMode sends the specific 'do not retry' deny message."""
+    from untether.telegram.commands.claude_control import (
+        _EXIT_PLAN_DENY_MESSAGE,
+        ClaudeControlCommand,
+    )
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-epm-deny"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-epm"] = session_id
+    _REQUEST_TO_INPUT["req-epm"] = {}
+    _REQUEST_TO_TOOL_NAME["req-epm"] = "ExitPlanMode"
+
+    from untether.commands import CommandContext
+    from untether.transport import MessageRef
+
+    ctx = CommandContext(
+        command="claude_control",
+        text="claude_control:deny:req-epm",
+        args_text="deny:req-epm",
+        args=("deny:req-epm",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config=None,  # type: ignore[arg-type]
+        runtime=None,  # type: ignore[arg-type]
+        executor=None,  # type: ignore[arg-type]
+    )
+
+    cmd = ClaudeControlCommand()
+    result = await cmd.handle(ctx)
+
+    assert result is not None
+    assert "Denied" in result.text
+
+    payload = json.loads(fake_stdin.send.call_args[0][0].decode())
+    inner = payload["response"]["response"]
+    assert inner["behavior"] == "deny"
+    assert inner["message"] == _EXIT_PLAN_DENY_MESSAGE
+    assert "Do NOT call ExitPlanMode again" in inner["message"]
+
+
+@pytest.mark.anyio
+async def test_deny_non_exit_plan_mode_uses_generic_message() -> None:
+    """Denying a non-ExitPlanMode tool uses the generic deny message."""
+    from untether.telegram.commands.claude_control import (
+        _DENY_MESSAGE,
+        ClaudeControlCommand,
+    )
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-bash-deny"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-bash"] = session_id
+    _REQUEST_TO_INPUT["req-bash"] = {}
+    _REQUEST_TO_TOOL_NAME["req-bash"] = "Bash"
+
+    from untether.commands import CommandContext
+    from untether.transport import MessageRef
+
+    ctx = CommandContext(
+        command="claude_control",
+        text="claude_control:deny:req-bash",
+        args_text="deny:req-bash",
+        args=("deny:req-bash",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config=None,  # type: ignore[arg-type]
+        runtime=None,  # type: ignore[arg-type]
+        executor=None,  # type: ignore[arg-type]
+    )
+
+    cmd = ClaudeControlCommand()
+    result = await cmd.handle(ctx)
+
+    assert result is not None
+
+    payload = json.loads(fake_stdin.send.call_args[0][0].decode())
+    inner = payload["response"]["response"]
+    assert inner["behavior"] == "deny"
+    assert inner["message"] == _DENY_MESSAGE
+
+
+# ---------------------------------------------------------------------------
+# Cancel cleanup (stale outline_guard / cooldown after cancel + resume)
+# ---------------------------------------------------------------------------
+
+
+class TestCancelCleanup:
+    """Verify _cleanup_session_registries clears all state, preventing
+    stale outline_guard after cancel + resume (#93)."""
+
+    def test_cleanup_clears_all_state(self):
+        sid = "sess-cleanup-all"
+        runner = ClaudeRunner(claude_cmd="claude")
+
+        # Populate every registry
+        _ACTIVE_RUNNERS[sid] = (runner, 0.0)
+        _SESSION_STDIN[sid] = AsyncMock()
+        _REQUEST_TO_SESSION["req-a"] = sid
+        _REQUEST_TO_SESSION["req-b"] = sid
+        set_discuss_cooldown(sid)  # sets _DISCUSS_COOLDOWN + _OUTLINE_PENDING
+        _DISCUSS_APPROVED.add(sid)
+
+        _cleanup_session_registries(sid)
+
+        assert sid not in _ACTIVE_RUNNERS
+        assert sid not in _SESSION_STDIN
+        assert "req-a" not in _REQUEST_TO_SESSION
+        assert "req-b" not in _REQUEST_TO_SESSION
+        assert sid not in _DISCUSS_COOLDOWN
+        assert sid not in _DISCUSS_APPROVED
+        assert sid not in _OUTLINE_PENDING
+
+    def test_cleanup_idempotent(self):
+        sid = "sess-cleanup-idem"
+        # Call twice on empty state — no error
+        _cleanup_session_registries(sid)
+        _cleanup_session_registries(sid)
+
+    def test_outline_pending_cleared_on_cancel_path(self):
+        """Simulate the production bug: Pause & Outline clicked, then cancelled."""
+        sid = "sess-cancel-outline"
+        runner = ClaudeRunner(claude_cmd="claude")
+
+        _ACTIVE_RUNNERS[sid] = (runner, 0.0)
+        _SESSION_STDIN[sid] = AsyncMock()
+        set_discuss_cooldown(sid)
+
+        assert sid in _OUTLINE_PENDING
+        assert check_discuss_cooldown(sid) is not None
+
+        # Simulates the finally block running on cancel
+        _cleanup_session_registries(sid)
+
+        assert sid not in _OUTLINE_PENDING
+        assert check_discuss_cooldown(sid) is None
+
+    def test_resumed_session_no_stale_outline_guard(self):
+        """After cleanup, a resumed session should not see outline_guard=True."""
+        sid = "sess-resume-guard"
+        runner = ClaudeRunner(claude_cmd="claude")
+
+        # Set up stale state (as if Pause & Outline was clicked before cancel)
+        _ACTIVE_RUNNERS[sid] = (runner, 0.0)
+        _SESSION_STDIN[sid] = AsyncMock()
+        set_discuss_cooldown(sid)
+        _OUTLINE_PENDING.add(sid)
+
+        # Cancel triggers cleanup
+        _cleanup_session_registries(sid)
+
+        # Verify the outline_guard check returns False
+        outline_guard = sid in _OUTLINE_PENDING and 0 < 200
+        assert not outline_guard
+
+
+# ---------------------------------------------------------------------------
+# Issue #148 — discuss-approval results skip reply to deleted outline message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_discuss_approve_edits_feedback_message() -> None:
+    """Post-outline 'Approve Plan' edits the discuss feedback message."""
+    from untether.commands import CommandContext
+    from untether.telegram.commands.claude_control import (
+        _DISCUSS_FEEDBACK_REFS,
+        ClaudeControlCommand,
+    )
+    from untether.transport import MessageRef
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-skip"
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+
+    # Simulate a stored discuss feedback ref
+    feedback_ref = MessageRef(channel_id=123, message_id=99)
+    _DISCUSS_FEEDBACK_REFS[session_id] = feedback_ref
+
+    fake_executor = AsyncMock()
+    ctx = CommandContext(
+        command="claude_control",
+        text=f"claude_control:approve:da:{session_id}",
+        args_text=f"approve:da:{session_id}",
+        args=(f"approve:da:{session_id}",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config={},
+        runtime=None,  # type: ignore[arg-type]
+        executor=fake_executor,
+    )
+
+    cmd = ClaudeControlCommand()
+    result = await cmd.handle(ctx)
+
+    # Handler edits the feedback message and returns None
+    assert result is None
+    fake_executor.edit.assert_called_once()
+    edit_ref, edit_text = fake_executor.edit.call_args[0]
+    assert edit_ref == feedback_ref
+    assert "approved" in edit_text.lower()
+    # Ref should be cleaned up
+    assert session_id not in _DISCUSS_FEEDBACK_REFS
+
+
+@pytest.mark.anyio
+async def test_discuss_deny_edits_feedback_message() -> None:
+    """Post-outline 'Deny' edits the discuss feedback message."""
+    from untether.commands import CommandContext
+    from untether.telegram.commands.claude_control import (
+        _DISCUSS_FEEDBACK_REFS,
+        ClaudeControlCommand,
+    )
+    from untether.transport import MessageRef
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-skip-deny"
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+
+    # Simulate a stored discuss feedback ref
+    feedback_ref = MessageRef(channel_id=123, message_id=99)
+    _DISCUSS_FEEDBACK_REFS[session_id] = feedback_ref
+
+    fake_executor = AsyncMock()
+    ctx = CommandContext(
+        command="claude_control",
+        text=f"claude_control:deny:da:{session_id}",
+        args_text=f"deny:da:{session_id}",
+        args=(f"deny:da:{session_id}",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config={},
+        runtime=None,  # type: ignore[arg-type]
+        executor=fake_executor,
+    )
+
+    cmd = ClaudeControlCommand()
+    result = await cmd.handle(ctx)
+
+    # Handler edits the feedback message and returns None
+    assert result is None
+    fake_executor.edit.assert_called_once()
+    edit_ref, edit_text = fake_executor.edit.call_args[0]
+    assert edit_ref == feedback_ref
+    assert "denied" in edit_text.lower()
+    # Ref should be cleaned up
+    assert session_id not in _DISCUSS_FEEDBACK_REFS
+
+
+@pytest.mark.anyio
+async def test_discuss_approve_falls_back_without_stored_ref() -> None:
+    """Post-outline approve falls back to CommandResult when no stored ref."""
+    from untether.commands import CommandContext
+    from untether.telegram.commands.claude_control import ClaudeControlCommand
+    from untether.transport import MessageRef
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-no-ref"
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    # No _DISCUSS_FEEDBACK_REFS entry
+
+    ctx = CommandContext(
+        command="claude_control",
+        text=f"claude_control:approve:da:{session_id}",
+        args_text=f"approve:da:{session_id}",
+        args=(f"approve:da:{session_id}",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config={},
+        runtime=None,  # type: ignore[arg-type]
+        executor=None,  # type: ignore[arg-type]
+    )
+
+    cmd = ClaudeControlCommand()
+    result = await cmd.handle(ctx)
+    # Falls back to CommandResult
+    assert result is not None
+    assert result.skip_reply is True
+    assert "approved" in result.text.lower()
+
+
+@pytest.mark.anyio
+async def test_normal_approve_edits_feedback_when_outline_ref_exists() -> None:
+    """Normal approve (real request_id, not da:) edits discuss feedback if ref stored."""
+    from untether.commands import CommandContext
+    from untether.telegram.commands.claude_control import (
+        _DISCUSS_FEEDBACK_REFS,
+        ClaudeControlCommand,
+    )
+    from untether.transport import MessageRef
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    session_id = "sess-normal-outline"
+
+    _ACTIVE_RUNNERS[session_id] = (runner, 0.0)
+    fake_stdin = AsyncMock()
+    _SESSION_STDIN[session_id] = fake_stdin
+    _REQUEST_TO_SESSION["req-outline-real"] = session_id
+    _REQUEST_TO_INPUT["req-outline-real"] = {}
+    _REQUEST_TO_TOOL_NAME["req-outline-real"] = "ExitPlanMode"
+
+    # Simulate a stored discuss feedback ref from the earlier "Pause & Outline" click
+    feedback_ref = MessageRef(channel_id=123, message_id=99)
+    _DISCUSS_FEEDBACK_REFS[session_id] = feedback_ref
+
+    fake_executor = AsyncMock()
+    ctx = CommandContext(
+        command="claude_control",
+        text="claude_control:approve:req-outline-real",
+        args_text="approve:req-outline-real",
+        args=("approve:req-outline-real",),
+        message=MessageRef(channel_id=123, message_id=1),
+        reply_to=None,
+        reply_text=None,
+        config_path=None,
+        plugin_config={},
+        runtime=None,  # type: ignore[arg-type]
+        executor=fake_executor,
+    )
+
+    cmd = ClaudeControlCommand()
+    result = await cmd.handle(ctx)
+
+    # Handler should edit the feedback message and return None
+    assert result is None
+    fake_executor.edit.assert_called_once()
+    edit_ref, edit_text = fake_executor.edit.call_args[0]
+    assert edit_ref == feedback_ref
+    assert "approved" in edit_text.lower()
+    # Ref should be cleaned up
+    assert session_id not in _DISCUSS_FEEDBACK_REFS

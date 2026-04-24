@@ -1,0 +1,277 @@
+import httpx
+import pytest
+
+from untether.telegram.api_models import User
+from untether.telegram.client_api import (
+    HttpBotClient,
+    TelegramRetryAfter,
+    retry_after_from_payload,
+)
+
+
+def _response() -> httpx.Response:
+    request = httpx.Request("POST", "https://example.com")
+    return httpx.Response(200, request=request)
+
+
+def test_retry_after_from_payload() -> None:
+    assert retry_after_from_payload({}) is None
+    assert retry_after_from_payload({"parameters": {"retry_after": 2}}) == 2.0
+
+
+def test_parse_envelope_invalid_payload() -> None:
+    client = HttpBotClient("token", http_client=httpx.AsyncClient())
+    assert (
+        client._parse_telegram_envelope(
+            method="sendMessage",
+            resp=_response(),
+            payload="nope",
+        )
+        is None
+    )
+
+
+def test_parse_envelope_rate_limited() -> None:
+    client = HttpBotClient("token", http_client=httpx.AsyncClient())
+    payload = {"ok": False, "error_code": 429, "parameters": {"retry_after": 1}}
+    with pytest.raises(TelegramRetryAfter) as exc:
+        client._parse_telegram_envelope(
+            method="sendMessage",
+            resp=_response(),
+            payload=payload,
+        )
+    assert exc.value.retry_after == 1.0
+
+
+def test_parse_envelope_api_error() -> None:
+    client = HttpBotClient("token", http_client=httpx.AsyncClient())
+    payload = {"ok": False, "error_code": 400, "description": "boom"}
+    assert (
+        client._parse_telegram_envelope(
+            method="sendMessage",
+            resp=_response(),
+            payload=payload,
+        )
+        is None
+    )
+
+
+def test_parse_envelope_ok() -> None:
+    client = HttpBotClient("token", http_client=httpx.AsyncClient())
+    payload = {"ok": True, "result": {"message_id": 1}}
+    assert client._parse_telegram_envelope(
+        method="sendMessage",
+        resp=_response(),
+        payload=payload,
+    ) == {"message_id": 1}
+
+
+@pytest.mark.anyio
+async def test_client_methods_build_params_and_decode() -> None:
+    payloads = {
+        "getUpdates": [{"update_id": 1}],
+        "getFile": {"file_path": "path"},
+        "sendMessage": {"message_id": 1, "chat": {"id": 1, "type": "private"}},
+        "sendDocument": {"message_id": 2, "chat": {"id": 1, "type": "private"}},
+        "editMessageText": {"message_id": 3, "chat": {"id": 1, "type": "private"}},
+        "deleteMessage": True,
+        "setMyCommands": True,
+        "getMe": {"id": 7},
+        "answerCallbackQuery": True,
+        "getChat": {"id": 5, "type": "private"},
+        "getChatMember": {"status": "member"},
+        "createForumTopic": {"message_thread_id": 11},
+        "editForumTopic": True,
+    }
+
+    class _StubClient(HttpBotClient):
+        def __init__(self) -> None:
+            super().__init__("token", http_client=httpx.AsyncClient())
+            self.calls: list[
+                tuple[str, dict | None, dict | None, dict | None, float | None]
+            ] = []
+
+        async def _request(
+            self,
+            method: str,
+            *,
+            json: dict | None = None,
+            data: dict | None = None,
+            files: dict | None = None,
+            request_timeout: float | None = None,
+        ) -> object | None:
+            self.calls.append((method, json, data, files, request_timeout))
+            return payloads.get(method)
+
+    client = _StubClient()
+
+    updates = await client.get_updates(offset=10, allowed_updates=["message"])
+    assert updates and updates[0].update_id == 1
+
+    assert await client.get_file("file") is not None
+
+    msg = await client.send_message(
+        1,
+        "hi",
+        reply_to_message_id=2,
+        disable_notification=True,
+        message_thread_id=3,
+        entities=[{"type": "bold", "offset": 0, "length": 2}],
+        parse_mode="Markdown",
+        reply_markup={"inline_keyboard": []},
+    )
+    assert msg and msg.message_id == 1
+
+    doc = await client.send_document(
+        1,
+        "file.txt",
+        b"data",
+        reply_to_message_id=2,
+        message_thread_id=3,
+        disable_notification=True,
+        caption="doc",
+    )
+    assert doc and doc.message_id == 2
+
+    edit = await client.edit_message_text(
+        1,
+        2,
+        "edit",
+        entities=[{"type": "italic", "offset": 0, "length": 4}],
+        parse_mode="Markdown",
+        reply_markup={"inline_keyboard": []},
+    )
+    assert edit and edit.message_id == 3
+
+    assert await client.delete_message(1, 2) is True
+    assert await client.set_my_commands(
+        [{"command": "ping", "description": "pong"}],
+        scope={"type": "chat"},
+        language_code="en",
+    )
+    assert await client.answer_callback_query("cb", text="ok", show_alert=True) is True
+    assert await client.get_chat(1) is not None
+    assert await client.get_chat_member(1, 2) is not None
+    assert await client.create_forum_topic(1, "topic") is not None
+    assert await client.edit_forum_topic(1, 2, "topic") is True
+
+    await client.close()
+
+    send_call = next(call for call in client.calls if call[0] == "sendMessage")
+    assert send_call[1]["disable_notification"] is True
+    assert send_call[1]["reply_to_message_id"] == 2
+    assert send_call[1]["message_thread_id"] == 3
+    assert send_call[1]["entities"]
+    assert send_call[1]["parse_mode"] == "Markdown"
+    assert send_call[1]["link_preview_options"] == {"is_disabled": True}
+    assert send_call[1]["reply_markup"]
+
+    doc_call = next(call for call in client.calls if call[0] == "sendDocument")
+    assert doc_call[2]["caption"] == "doc"
+    assert doc_call[3]["document"][0] == "file.txt"
+
+    edit_call = next(call for call in client.calls if call[0] == "editMessageText")
+    assert edit_call[1]["link_preview_options"] == {"is_disabled": True}
+
+
+def test_default_timeout_is_30s() -> None:
+    client = HttpBotClient("token")
+    # httpx stores timeout as httpx.Timeout; default pool/connect/read/write = 30
+    assert client._http_client.timeout.read == 30
+
+
+@pytest.mark.anyio
+async def test_get_updates_passes_per_request_timeout() -> None:
+    payloads = {"getUpdates": [{"update_id": 1}]}
+
+    class _Stub(HttpBotClient):
+        def __init__(self) -> None:
+            super().__init__("token", http_client=httpx.AsyncClient())
+            self.last_timeout: float | None = None
+
+        async def _request(
+            self,
+            method: str,
+            *,
+            json: dict | None = None,
+            data: dict | None = None,
+            files: dict | None = None,
+            request_timeout: float | None = None,
+        ) -> object | None:
+            self.last_timeout = request_timeout
+            return payloads.get(method)
+
+    client = _Stub()
+    await client.get_updates(offset=None, timeout_s=50)
+    assert client.last_timeout == 70  # timeout_s + 20
+    await client.close()
+
+
+@pytest.mark.anyio
+async def test_send_message_uses_default_timeout() -> None:
+    payloads = {"sendMessage": {"message_id": 1, "chat": {"id": 1, "type": "private"}}}
+
+    class _Stub(HttpBotClient):
+        def __init__(self) -> None:
+            super().__init__("token", http_client=httpx.AsyncClient())
+            self.last_timeout: float | None = None
+
+        async def _request(
+            self,
+            method: str,
+            *,
+            json: dict | None = None,
+            data: dict | None = None,
+            files: dict | None = None,
+            request_timeout: float | None = None,
+        ) -> object | None:
+            self.last_timeout = request_timeout
+            return payloads.get(method)
+
+    client = _Stub()
+    await client.send_message(1, "hi")
+    assert client.last_timeout is None  # uses client default, no per-request override
+    await client.close()
+
+
+@pytest.mark.anyio
+async def test_decode_result_invalid_payload_returns_none() -> None:
+    client = HttpBotClient("token", http_client=httpx.AsyncClient())
+    assert client._decode_result(method="getMe", payload=["bad"], model=User) is None
+    await client.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "bogus_path",
+    [
+        "https://evil.example.com/exfil",  # absolute URL
+        "//evil.example.com/x",  # scheme-relative
+        "../../../etc/passwd",  # traversal
+        "documents/../../secret",  # embedded traversal
+        "/absolute/unix/path",  # absolute path
+    ],
+)
+async def test_download_file_rejects_path_with_scheme_or_traversal(
+    bogus_path: str,
+) -> None:
+    """#204: a spoofed/tampered getFile response that returns a file_path
+    containing a URL scheme or '..' must not cause download_file to issue a
+    request to an arbitrary host."""
+
+    class _NoNetworkClient(HttpBotClient):
+        def __init__(self) -> None:
+            super().__init__("token", http_client=httpx.AsyncClient())
+            self.got_called = False
+
+        async def _request(self, *args, **kwargs):  # pragma: no cover
+            self.got_called = True
+            raise AssertionError("network request must not be attempted")
+
+    client = _NoNetworkClient()
+    try:
+        result = await client.download_file(bogus_path)
+        assert result is None
+        assert client.got_called is False
+    finally:
+        await client.close()

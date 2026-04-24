@@ -1,0 +1,172 @@
+import pytest
+
+from untether.telegram.chat_prefs import ChatPrefsStore
+from untether.telegram.engine_overrides import (
+    EngineOverrides,
+    merge_overrides,
+    resolve_override_value,
+)
+from untether.telegram.topic_state import TopicStateStore
+
+
+def test_merge_overrides_prefers_topic_values() -> None:
+    topic = EngineOverrides(model=None, reasoning="high")
+    chat = EngineOverrides(model="gpt-4.1-mini", reasoning=None)
+    merged = merge_overrides(topic, chat)
+
+    assert merged is not None
+    assert merged.model == "gpt-4.1-mini"
+    assert merged.reasoning == "high"
+
+
+def test_resolve_override_value_tracks_sources() -> None:
+    topic = EngineOverrides(model="gpt-4.1", reasoning=None)
+    chat = EngineOverrides(model="gpt-4.1-mini", reasoning="low")
+    resolution = resolve_override_value(
+        topic_override=topic,
+        chat_override=chat,
+        field="model",
+    )
+
+    assert resolution.value == "gpt-4.1"
+    assert resolution.source == "topic_override"
+    assert resolution.topic_value == "gpt-4.1"
+    assert resolution.chat_value == "gpt-4.1-mini"
+
+
+@pytest.mark.anyio
+async def test_chat_prefs_engine_overrides_roundtrip(tmp_path) -> None:
+    path = tmp_path / "telegram_chat_prefs_state.json"
+    store = ChatPrefsStore(path)
+    await store.set_engine_override(
+        123,
+        "codex",
+        EngineOverrides(model="gpt-4.1-mini", reasoning="low"),
+    )
+
+    override = await store.get_engine_override(123, "codex")
+    assert override is not None
+    assert override.model == "gpt-4.1-mini"
+    assert override.reasoning == "low"
+
+    store2 = ChatPrefsStore(path)
+    override2 = await store2.get_engine_override(123, "codex")
+    assert override2 is not None
+    assert override2.model == "gpt-4.1-mini"
+    assert override2.reasoning == "low"
+
+    await store2.set_engine_override(
+        123,
+        "codex",
+        EngineOverrides(model=None, reasoning="low"),
+    )
+    override3 = await store2.get_engine_override(123, "codex")
+    assert override3 is not None
+    assert override3.model is None
+    assert override3.reasoning == "low"
+
+    await store2.set_engine_override(
+        123,
+        "codex",
+        EngineOverrides(model=None, reasoning=None),
+    )
+    override4 = await store2.get_engine_override(123, "codex")
+    assert override4 is None
+
+
+@pytest.mark.anyio
+async def test_topic_state_engine_overrides_roundtrip(tmp_path) -> None:
+    path = tmp_path / "telegram_topics_state.json"
+    store = TopicStateStore(path)
+    await store.set_engine_override(
+        1,
+        10,
+        "codex",
+        EngineOverrides(model="gpt-4.1", reasoning="medium"),
+    )
+
+    override = await store.get_engine_override(1, 10, "codex")
+    assert override is not None
+    assert override.model == "gpt-4.1"
+    assert override.reasoning == "medium"
+
+    store2 = TopicStateStore(path)
+    override2 = await store2.get_engine_override(1, 10, "codex")
+    assert override2 is not None
+    assert override2.model == "gpt-4.1"
+    assert override2.reasoning == "medium"
+
+
+def test_merge_overrides_diff_preview_topic_wins() -> None:
+    topic = EngineOverrides(diff_preview=False)
+    chat = EngineOverrides(diff_preview=True)
+    merged = merge_overrides(topic, chat)
+    assert merged is not None
+    assert merged.diff_preview is False
+
+
+def test_merge_overrides_diff_preview_chat_fallback() -> None:
+    topic = EngineOverrides(diff_preview=None)
+    chat = EngineOverrides(diff_preview=True)
+    merged = merge_overrides(topic, chat)
+    assert merged is not None
+    assert merged.diff_preview is True
+
+
+def test_get_engine_default_reasoning_claude(tmp_path) -> None:
+    """Reads effortLevel from Claude settings.json."""
+    import json
+    from unittest.mock import patch
+
+    from untether.telegram.engine_overrides import get_engine_default_reasoning
+
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text(json.dumps({"effortLevel": "high"}))
+
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        assert get_engine_default_reasoning("claude") == "high"
+
+
+def test_get_engine_default_reasoning_claude_max(tmp_path) -> None:
+    """Reads max effort level from Claude settings.json."""
+    import json
+    from unittest.mock import patch
+
+    from untether.telegram.engine_overrides import get_engine_default_reasoning
+
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text(json.dumps({"effortLevel": "max"}))
+
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        assert get_engine_default_reasoning("claude") == "max"
+
+
+def test_get_engine_default_reasoning_no_file(tmp_path) -> None:
+    """Returns None when settings file doesn't exist."""
+    from unittest.mock import patch
+
+    from untether.telegram.engine_overrides import get_engine_default_reasoning
+
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        assert get_engine_default_reasoning("claude") is None
+
+
+def test_get_engine_default_reasoning_unsupported_engine() -> None:
+    """Returns None for engines without config file support."""
+    from untether.telegram.engine_overrides import get_engine_default_reasoning
+
+    assert get_engine_default_reasoning("codex") is None
+    assert get_engine_default_reasoning("gemini") is None
+
+
+def test_get_reasoning_label() -> None:
+    """Engine-specific reasoning labels."""
+    from untether.telegram.engine_overrides import get_reasoning_label
+
+    assert get_reasoning_label("claude") == "Effort"
+    assert get_reasoning_label("codex") == "Reasoning"
+    assert get_reasoning_label("pi") == "Thinking"
+    assert get_reasoning_label("gemini") == "Reasoning"
+    assert get_reasoning_label("amp") == "Reasoning"

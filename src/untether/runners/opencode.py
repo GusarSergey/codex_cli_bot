@@ -1,0 +1,686 @@
+"""OpenCode CLI runner.
+
+This runner integrates with the OpenCode CLI (https://github.com/sst/opencode).
+
+OpenCode outputs JSON events in a streaming format with types:
+- step_start: Marks the beginning of a processing step
+- tool_use: Tool invocation with input/output
+- text: Text output from the model
+- step_finish: Marks the end of a step (with reason: "stop" or "tool-calls")
+
+Session IDs use the format: ses_XXXX (e.g., ses_494719016ffe85dkDMj0FPRbHK)
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+import msgspec
+
+from ..backends import EngineBackend, EngineConfig
+from ..config import ConfigError
+from ..logging import get_logger
+from ..model import (
+    Action,
+    ActionEvent,
+    ActionKind,
+    CompletedEvent,
+    EngineId,
+    ResumeToken,
+    StartedEvent,
+    UntetherEvent,
+)
+from ..runner import (
+    JsonlSubprocessRunner,
+    ResumeTokenMixin,
+    Runner,
+    _rc_label,
+    _session_label,
+    _stderr_excerpt,
+)
+from ..schemas import opencode as opencode_schema
+from ..utils.paths import relativize_path
+from .run_options import get_run_options
+from .tool_actions import tool_input_path, tool_kind_and_title
+
+logger = get_logger(__name__)
+
+ENGINE: EngineId = "opencode"
+
+_RESUME_RE = re.compile(
+    r"(?im)^\s*`?opencode(?:\s+run)?\s+(?:--session|-s)\s+(?P<token>ses_[A-Za-z0-9]+)`?\s*$"
+)
+
+
+def _extract_event_type(raw: str) -> str | None:
+    """Extract the ``type`` field from raw JSON for diagnostics.
+
+    Used when msgspec raises DecodeError (unrecognised event type) to provide
+    visible feedback instead of silently dropping the event.
+    """
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            t = obj.get("type")
+            if isinstance(t, str):
+                return t
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+@dataclass(slots=True)
+class OpenCodeStreamState:
+    """State tracked during OpenCode JSONL streaming."""
+
+    pending_actions: dict[str, Action] = field(default_factory=dict)
+    last_text: str | None = None
+    last_tool_error: str | None = None
+    note_seq: int = 0
+    session_id: str | None = None
+    emitted_started: bool = False
+    saw_step_finish: bool = False
+    accumulated_cost: float = 0.0
+    accumulated_tokens: dict[str, int] = field(default_factory=dict)
+
+
+def _action_event(
+    *,
+    phase: Literal["started", "updated", "completed"],
+    action: Action,
+    ok: bool | None = None,
+    message: str | None = None,
+    level: Literal["debug", "info", "warning", "error"] | None = None,
+) -> ActionEvent:
+    return ActionEvent(
+        engine=ENGINE,
+        action=action,
+        phase=phase,
+        ok=ok,
+        message=message,
+        level=level,
+    )
+
+
+def _accumulate_step_cost(state: OpenCodeStreamState, part: dict[str, Any]) -> None:
+    """Accumulate cost and token data from a step_finish event."""
+    cost = part.get("cost")
+    if isinstance(cost, (int, float)):
+        state.accumulated_cost += float(cost)
+    tokens = part.get("tokens")
+    if isinstance(tokens, dict):
+        for key in ("input", "output", "reasoning"):
+            val = tokens.get(key)
+            if isinstance(val, int):
+                state.accumulated_tokens[key] = (
+                    state.accumulated_tokens.get(key, 0) + val
+                )
+        cache = tokens.get("cache")
+        if isinstance(cache, dict):
+            for key in ("read", "write"):
+                val = cache.get(key)
+                if isinstance(val, int):
+                    cache_key = f"cache_{key}"
+                    state.accumulated_tokens[cache_key] = (
+                        state.accumulated_tokens.get(cache_key, 0) + val
+                    )
+
+
+def _build_usage(state: OpenCodeStreamState) -> dict[str, Any] | None:
+    """Build a usage dict from accumulated cost/token data."""
+    if state.accumulated_cost <= 0 and not state.accumulated_tokens:
+        return None
+    usage: dict[str, Any] = {}
+    if state.accumulated_cost > 0:
+        usage["total_cost_usd"] = state.accumulated_cost
+    if state.accumulated_tokens:
+        usage["usage"] = {
+            "input_tokens": state.accumulated_tokens.get("input", 0),
+            "output_tokens": state.accumulated_tokens.get("output", 0),
+        }
+        reasoning = state.accumulated_tokens.get("reasoning", 0)
+        if reasoning:
+            usage["usage"]["reasoning_tokens"] = reasoning
+        cache_read = state.accumulated_tokens.get("cache_read", 0)
+        cache_write = state.accumulated_tokens.get("cache_write", 0)
+        if cache_read or cache_write:
+            usage["usage"]["cache_read_tokens"] = cache_read
+            usage["usage"]["cache_write_tokens"] = cache_write
+    return usage
+
+
+def _tool_kind_and_title(
+    tool_name: str, tool_input: dict[str, Any]
+) -> tuple[ActionKind, str]:
+    return tool_kind_and_title(
+        tool_name,
+        tool_input,
+        path_keys=("file_path", "filePath"),
+        task_kind="tool",
+    )
+
+
+def _normalize_tool_title(
+    title: str,
+    *,
+    tool_input: dict[str, Any],
+) -> str:
+    if "`" in title:
+        return title
+
+    path = tool_input_path(tool_input, path_keys=("file_path", "filePath"))
+    if isinstance(path, str) and path:
+        rel_path = relativize_path(path)
+        if title in (path, rel_path):
+            return f"`{rel_path}`"
+
+    return title
+
+
+def _extract_tool_action(part: dict[str, Any]) -> Action | None:
+    """Extract an Action from an OpenCode tool_use part."""
+    state = part.get("state") or {}
+
+    call_id = part.get("callID")
+    if not isinstance(call_id, str) or not call_id:
+        call_id = part.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            return None
+
+    tool_name = part.get("tool") or "tool"
+    tool_input = state.get("input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    kind, title = _tool_kind_and_title(tool_name, tool_input)
+
+    state_title = state.get("title")
+    if isinstance(state_title, str) and state_title:
+        title = _normalize_tool_title(state_title, tool_input=tool_input)
+
+    detail: dict[str, Any] = {
+        "name": tool_name,
+        "input": tool_input,
+        "callID": call_id,
+    }
+
+    if kind == "file_change":
+        path = tool_input.get("file_path") or tool_input.get("filePath")
+        if path:
+            detail["changes"] = [{"path": path, "kind": "update"}]
+
+    return Action(id=call_id, kind=kind, title=title, detail=detail)
+
+
+def translate_opencode_event(
+    event: opencode_schema.OpenCodeEvent,
+    *,
+    title: str,
+    state: OpenCodeStreamState,
+    meta: dict[str, Any] | None = None,
+) -> list[UntetherEvent]:
+    """Translate an OpenCode JSON event into Untether events."""
+    session_id = event.sessionID
+
+    if isinstance(session_id, str) and session_id and state.session_id is None:
+        state.session_id = session_id
+        logger.debug("opencode.session.extracted", session_id=session_id)
+
+    match event:
+        case opencode_schema.StepStart():
+            if not state.emitted_started and state.session_id:
+                state.emitted_started = True
+                logger.info(
+                    "opencode.session.started", session_id=state.session_id, title=title
+                )
+                return [
+                    StartedEvent(
+                        engine=ENGINE,
+                        resume=ResumeToken(engine=ENGINE, value=state.session_id),
+                        title=title,
+                        meta=meta,
+                    )
+                ]
+            return []
+
+        case opencode_schema.ToolUse(part=part):
+            part = part or {}
+            tool_state = part.get("state") or {}
+            status = tool_state.get("status")
+
+            action = _extract_tool_action(part)
+            if action is None:
+                return []
+
+            if status == "completed":
+                output = tool_state.get("output")
+                metadata = tool_state.get("metadata") or {}
+                exit_code = metadata.get("exit")
+
+                is_error = False
+                if isinstance(exit_code, int) and exit_code != 0:
+                    is_error = True
+
+                detail = dict(action.detail)
+                if output is not None:
+                    detail["output_preview"] = (
+                        str(output)[:500] if len(str(output)) > 500 else str(output)
+                    )
+                detail["exit_code"] = exit_code
+
+                state.pending_actions.pop(action.id, None)
+
+                return [
+                    _action_event(
+                        phase="completed",
+                        action=Action(
+                            id=action.id,
+                            kind=action.kind,
+                            title=action.title,
+                            detail=detail,
+                        ),
+                        ok=not is_error,
+                    )
+                ]
+            if status == "error":
+                error = tool_state.get("error")
+                metadata = tool_state.get("metadata") or {}
+                exit_code = metadata.get("exit")
+
+                detail = dict(action.detail)
+                if error is not None:
+                    detail["error"] = error
+                    state.last_tool_error = str(error)
+                detail["exit_code"] = exit_code
+
+                state.pending_actions.pop(action.id, None)
+
+                return [
+                    _action_event(
+                        phase="completed",
+                        action=Action(
+                            id=action.id,
+                            kind=action.kind,
+                            title=action.title,
+                            detail=detail,
+                        ),
+                        ok=False,
+                        message=str(error) if error is not None else None,
+                    )
+                ]
+            else:
+                state.pending_actions[action.id] = action
+                return [_action_event(phase="started", action=action)]
+
+        case opencode_schema.Text(part=part):
+            part = part or {}
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                if state.last_text is None:
+                    state.last_text = text
+                else:
+                    state.last_text += text
+            return []
+
+        case opencode_schema.StepFinish(part=part):
+            part = part or {}
+            reason = part.get("reason")
+            state.saw_step_finish = True
+            _accumulate_step_cost(state, part)
+
+            if reason == "stop":
+                resume = None
+                if state.session_id:
+                    resume = ResumeToken(engine=ENGINE, value=state.session_id)
+
+                usage = _build_usage(state)
+                # When OpenCode handles errors internally (e.g. file not
+                # found), it may complete normally with no Text events.
+                # Fall back to the last tool error message.
+                answer = state.last_text or state.last_tool_error or ""
+                logger.info(
+                    "opencode.completed",
+                    session_id=state.session_id,
+                    answer_len=len(answer),
+                    cost=state.accumulated_cost,
+                )
+                return [
+                    CompletedEvent(
+                        engine=ENGINE,
+                        ok=True,
+                        answer=answer,
+                        resume=resume,
+                        usage=usage,
+                    )
+                ]
+            return []
+
+        case opencode_schema.Error(error=error_value, message=message_value):
+            raw_message = message_value if message_value is not None else error_value
+
+            message = raw_message
+            if isinstance(message, dict):
+                data = message.get("data")
+                if isinstance(data, dict) and data.get("message"):
+                    message = data.get("message")
+                else:
+                    message = (
+                        message.get("message")
+                        or message.get("name")
+                        or "opencode error"
+                    )
+            elif message is None:
+                message = "opencode error"
+
+            resume = None
+            if state.session_id:
+                resume = ResumeToken(engine=ENGINE, value=state.session_id)
+
+            logger.error(
+                "opencode.error",
+                session_id=state.session_id,
+                error=str(message),
+            )
+            return [
+                CompletedEvent(
+                    engine=ENGINE,
+                    ok=False,
+                    answer=state.last_text or str(message),
+                    resume=resume,
+                    error=str(message),
+                )
+            ]
+
+        case _:
+            logger.debug(
+                "opencode.event.unrecognised",
+                event_type=type(event).__name__,
+            )
+            return []
+
+
+@dataclass(slots=True)
+class OpenCodeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
+    """Runner for OpenCode CLI."""
+
+    engine: EngineId = ENGINE
+    resume_re: re.Pattern[str] = _RESUME_RE
+
+    opencode_cmd: str = "opencode"
+    model: str | None = None
+    session_title: str = "opencode"
+    logger = logger
+
+    def format_resume(self, token: ResumeToken) -> str:
+        if token.engine != ENGINE:
+            raise RuntimeError(f"resume token is for engine {token.engine!r}")
+        return f"`opencode --session {token.value}`"
+
+    def command(self) -> str:
+        return self.opencode_cmd
+
+    def build_args(
+        self,
+        prompt: str,
+        resume: ResumeToken | None,
+        *,
+        state: Any,
+    ) -> list[str]:
+        run_options = get_run_options()
+        args = ["run", "--format", "json"]
+        if resume is not None:
+            if resume.is_continue:
+                args.append("--continue")
+            else:
+                args.extend(["--session", resume.value])
+        model = self.model
+        if run_options is not None and run_options.model:
+            model = run_options.model
+        if model is not None:
+            args.extend(["--model", str(model)])
+        args.extend(["--", prompt])
+        return args
+
+    def stdin_payload(
+        self,
+        prompt: str,
+        resume: ResumeToken | None,
+        *,
+        state: Any,
+    ) -> bytes | None:
+        return None
+
+    def new_state(self, prompt: str, resume: ResumeToken | None) -> OpenCodeStreamState:
+        return OpenCodeStreamState()
+
+    def start_run(
+        self,
+        prompt: str,
+        resume: ResumeToken | None,
+        *,
+        state: OpenCodeStreamState,
+    ) -> None:
+        pass
+
+    def invalid_json_events(
+        self,
+        *,
+        raw: str,
+        line: str,
+        state: OpenCodeStreamState,
+    ) -> list[UntetherEvent]:
+        message = "invalid JSON from opencode; ignoring line"
+        return [self.note_event(message, state=state, detail={"line": raw})]
+
+    def translate(
+        self,
+        data: opencode_schema.OpenCodeEvent,
+        *,
+        state: OpenCodeStreamState,
+        resume: ResumeToken | None,
+        found_session: ResumeToken | None,
+    ) -> list[UntetherEvent]:
+        # Build meta from runner config (OpenCode JSONL doesn't include model info)
+        meta: dict[str, Any] | None = None
+        model = self.model
+        run_options = get_run_options()
+        if run_options is not None and run_options.model:
+            model = run_options.model
+        if model is not None:
+            meta = {"model": str(model)}
+
+        return translate_opencode_event(
+            data,
+            title=self.session_title,
+            state=state,
+            meta=meta,
+        )
+
+    def decode_jsonl(self, *, line: bytes) -> opencode_schema.OpenCodeEvent:
+        return opencode_schema.decode_event(line)
+
+    def decode_error_events(
+        self,
+        *,
+        raw: str,
+        line: str,
+        error: Exception,
+        state: OpenCodeStreamState,
+    ) -> list[UntetherEvent]:
+        if isinstance(error, msgspec.DecodeError):
+            event_type = _extract_event_type(raw)
+            if event_type:
+                self.get_logger().warning(
+                    "opencode.event.unsupported",
+                    event_type=event_type,
+                    tag=self.tag(),
+                )
+                return [
+                    self.note_event(
+                        f"opencode emitted unsupported event: {event_type}",
+                        state=state,
+                    )
+                ]
+            self.get_logger().warning(
+                "jsonl.msgspec.invalid",
+                tag=self.tag(),
+                error=str(error),
+                error_type=error.__class__.__name__,
+            )
+            return []
+        # Explicit parent ref: zero-arg super() breaks in @dataclass(slots=True)
+        # on Python <3.14 because the __class__ cell references the pre-slot class.
+        return JsonlSubprocessRunner.decode_error_events(
+            self,
+            raw=raw,
+            line=line,
+            error=error,
+            state=state,
+        )
+
+    def process_error_events(
+        self,
+        rc: int,
+        *,
+        resume: ResumeToken | None,
+        found_session: ResumeToken | None,
+        state: OpenCodeStreamState,
+        stderr_lines: list[str] | None = None,
+    ) -> list[UntetherEvent]:
+        parts = [f"opencode failed ({_rc_label(rc)})."]
+        session = _session_label(found_session, resume)
+        if session:
+            parts.append(f"session: {session}")
+        excerpt = _stderr_excerpt(stderr_lines)
+        if excerpt:
+            parts.append(excerpt)
+        message = "\n".join(parts)
+        logger.error("opencode.process.failed", rc=rc, session_id=state.session_id)
+        resume_for_completed = found_session or resume
+        return [
+            self.note_event(
+                message,
+                state=state,
+                ok=False,
+            ),
+            CompletedEvent(
+                engine=ENGINE,
+                ok=False,
+                answer=state.last_text or message,
+                resume=resume_for_completed,
+                error=message,
+            ),
+        ]
+
+    def stream_end_events(
+        self,
+        *,
+        resume: ResumeToken | None,
+        found_session: ResumeToken | None,
+        state: OpenCodeStreamState,
+    ) -> list[UntetherEvent]:
+        if not found_session:
+            parts = ["opencode finished but no session_id was captured"]
+            session = _session_label(None, resume)
+            if session:
+                parts.append(f"session: {session}")
+            message = "\n".join(parts)
+            logger.warning("opencode.stream.no_session")
+            resume_for_completed = resume
+            return [
+                CompletedEvent(
+                    engine=ENGINE,
+                    ok=False,
+                    answer=state.last_text or message,
+                    resume=resume_for_completed,
+                    error=message,
+                )
+            ]
+
+        if state.saw_step_finish:
+            answer = state.last_text or state.last_tool_error or ""
+            return [
+                CompletedEvent(
+                    engine=ENGINE,
+                    ok=True,
+                    answer=answer,
+                    resume=found_session,
+                    usage=_build_usage(state),
+                )
+            ]
+
+        parts = ["opencode finished without a result event"]
+        session = _session_label(found_session, resume)
+        if session:
+            parts.append(f"session: {session}")
+        message = "\n".join(parts)
+        return [
+            CompletedEvent(
+                engine=ENGINE,
+                ok=False,
+                answer=state.last_text or message,
+                resume=found_session,
+                error=message,
+            )
+        ]
+
+
+def _read_opencode_default_model() -> str | None:
+    """Read the default model from OpenCode's own config file.
+
+    OpenCode stores its config at ``~/.config/opencode/opencode.json`` with a
+    top-level ``"model"`` key (e.g. ``"openai/gpt-5.2"``).  We read this at
+    runner construction time so the model appears in the Telegram footer even
+    when no override is set in ``untether.toml``.
+    """
+    oc_config = Path.home() / ".config" / "opencode" / "opencode.json"
+    try:
+        data = json.loads(oc_config.read_text(encoding="utf-8"))
+        model = data.get("model")
+        if isinstance(model, str) and model:
+            return model
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def build_runner(config: EngineConfig, config_path: Path) -> Runner:
+    """Build an OpenCodeRunner from configuration."""
+    opencode_cmd = "opencode"
+
+    model = config.get("model")
+    if model is not None and not isinstance(model, str):
+        logger.warning(
+            "opencode.config.invalid",
+            error="model must be a string",
+            config_path=str(config_path),
+        )
+        raise ConfigError(
+            f"Invalid `opencode.model` in {config_path}; expected a string."
+        )
+
+    # Fall back to OpenCode's own config for the default model so it appears
+    # in the Telegram footer even without an untether.toml override.
+    if model is None:
+        model = _read_opencode_default_model()
+        if model is not None:
+            logger.debug("opencode.default_model.detected", model=model)
+
+    title = str(model) if model is not None else "opencode"
+
+    return OpenCodeRunner(
+        opencode_cmd=opencode_cmd,
+        model=model,
+        session_title=title,
+    )
+
+
+BACKEND = EngineBackend(
+    id="opencode",
+    build_runner=build_runner,
+    install_cmd="npm install -g opencode-ai@latest",
+)

@@ -1,0 +1,353 @@
+# Telegram Transport
+
+## Overview
+
+`TelegramClient` is the single transport for Telegram writes. It owns a
+`TelegramOutbox` that serializes send/edit/delete operations, applies
+coalescing, and enforces rate limits + retry-after backoff.
+
+This document captures current behavior so transport changes stay intentional.
+
+## Flow
+
+1. Engine CLI emits JSONL events.
+2. We render progress on every step and diff against the last output.
+3. Only deltas enqueue a Telegram edit.
+4. High-value messages enqueue a send.
+5. All writes go through the outbox.
+
+## Incoming messages
+
+`parse_incoming_update` accepts text messages and voice notes.
+
+### Voice transcription
+
+If voice transcription is enabled, untether downloads the voice payload from Telegram,
+transcribes it with OpenAI, and routes the transcript through the same command and
+directive pipeline as typed text.
+
+Configuration (under `[transports.telegram]`):
+
+=== "untether config"
+
+    ```sh
+    untether config set transports.telegram.voice_transcription true
+    untether config set transports.telegram.voice_transcription_model "gpt-4o-mini-transcribe"
+
+    # local OpenAI-compatible transcription server (optional)
+    untether config set transports.telegram.voice_transcription_base_url "http://localhost:8000/v1"
+    untether config set transports.telegram.voice_transcription_api_key "local"
+    ```
+
+=== "toml"
+
+    ```toml
+    voice_transcription = true
+    voice_transcription_model = "gpt-4o-mini-transcribe" # optional
+    voice_transcription_base_url = "http://localhost:8000/v1" # optional
+    voice_transcription_api_key = "local" # optional
+    ```
+
+Set `OPENAI_API_KEY` in the environment (or `voice_transcription_api_key` in config).
+If transcription is enabled but no API key is available or the audio download fails,
+untether replies with a short error and skips the run.
+
+To use a local OpenAI-compatible Whisper server, set `voice_transcription_base_url`
+(and `voice_transcription_api_key` if the server expects one). This keeps engine
+requests on their own base URL without relying on `OPENAI_BASE_URL`. If your server
+requires a specific model name, set `voice_transcription_model` (for example,
+`whisper-1`).
+
+### Trigger mode (mentions-only)
+
+Telegram’s bot privacy mode stops bots from seeing every message by default, but
+**admins always receive all messages** in groups. If you promote untether to admin,
+Telegram will deliver every update even when privacy mode is enabled.
+
+To restore “only respond when invoked” behavior, use trigger mode:
+
+- `all` (default): any message can start a run (subject to ignore rules).
+- `mentions`: only start when explicitly invoked.
+
+Explicit invocation includes any of:
+
+- `@botname` mention in the message.
+- `/<engine-id>` or `/<project-alias>` as the first token.
+- Replying to a bot message.
+- Built-in or plugin slash commands (for example `/agent`, `/model`, `/reasoning`, `/file`, `/trigger`).
+
+Note: In forum topics, some Telegram clients include `reply_to_message` on every
+message, pointing at the topic’s root service message (`message_id ==
+message_thread_id`). Untether treats those as implicit topic references, not
+explicit replies, so they do not trigger mentions-only mode.
+
+Commands:
+
+- `/trigger` shows the current mode and defaults.
+- `/trigger mentions` restricts runs to explicit invocations.
+- `/trigger all` restores the default behavior.
+- `/trigger clear` clears a topic override (topics only).
+
+In group chats, changing trigger mode requires the sender to be an admin.
+
+State is stored in `telegram_chat_prefs_state.json` (chat default) and
+`telegram_topics_state.json` (topic overrides) alongside the config file.
+
+### Forwarded message coalescing
+
+Telegram sends a "comment + forwards" burst as separate messages, with the comment
+arriving first. Untether waits briefly so it can attach the forwarded messages and
+run once.
+
+Behavior:
+
+- When a prompt candidate arrives, Untether waits for `forward_coalesce_s` seconds
+  of quiet for that sender + chat/topic.
+- Forwarded messages arriving during the window are appended to the prompt
+  (separated by blank lines) and do not start their own runs.
+- Forwarded messages by themselves do not start runs.
+
+Configuration (under `[transports.telegram]`):
+
+=== "untether config"
+
+    ```sh
+    untether config set transports.telegram.forward_coalesce_s 1.0
+    ```
+
+=== "toml"
+
+    ```toml
+    forward_coalesce_s = 1.0 # set 0 to disable the delay
+    ```
+
+### Media group coalescing
+
+When a user sends multiple documents as a Telegram media group (album), Telegram
+delivers them as separate messages sharing a `media_group_id`. Untether buffers
+these messages and processes them as a single batch once the group is complete.
+
+Behavior:
+
+- Messages with a `media_group_id` are collected by the `MediaGroupBuffer`.
+- After `media_group_debounce_s` seconds of quiet (no new messages in the same
+  group), the buffer flushes and routes the group to `handle_media_group`.
+- Each flush resets the debounce timer if new messages arrive before it fires.
+
+Configuration (under `[transports.telegram]`):
+
+=== "untether config"
+
+    ```sh
+    untether config set transports.telegram.media_group_debounce_s 1.0
+    ```
+
+=== "toml"
+
+    ```toml
+    media_group_debounce_s = 1.0 # set 0 to disable the delay
+    ```
+
+## Chat sessions
+
+Session mode determines how conversations continue — this is the core difference between the three [workflow modes](../modes.md):
+
+- **Assistant / Workspace** (`session_mode = "chat"`) — auto-resume; messages continue the last session automatically
+- **Handoff** (`session_mode = "stateless"`) — reply-to-continue; each message starts a new run unless you reply to a previous one
+
+Configuration (under `[transports.telegram]`):
+
+=== "untether config"
+
+    ```sh
+    untether config set transports.telegram.show_resume_line true
+    untether config set transports.telegram.session_mode "chat"
+    ```
+
+=== "toml"
+
+    ```toml
+    show_resume_line = true # set false to hide resume lines
+    session_mode = "chat" # or "stateless"
+    ```
+
+Behavior:
+
+- Stores one resume token per engine per chat (per sender in group chats).
+- Auto-resumes when no explicit resume token is present.
+- Reply resume lines always take precedence and update the stored session for that engine.
+- Reset with `/new`.
+
+State is stored in `telegram_chat_sessions_state.json` alongside the config file.
+
+Set `show_resume_line = false` to hide resume lines when untether can auto-resume
+(topics or chat sessions) and a project context is resolved. Otherwise the resume
+line stays visible so reply-to-continue still works.
+
+## Message overflow
+
+By default, untether splits long final responses across multiple messages to stay
+under Telegram's 4096 character limit after entity parsing. You can opt into
+trimming instead:
+
+=== "untether config"
+
+    ```sh
+    untether config set transports.telegram.message_overflow "trim"
+    ```
+
+=== "toml"
+
+    ```toml
+    [transports.telegram]
+    message_overflow = "trim" # trim | split
+    ```
+
+Split mode sends multiple messages. Each chunk includes the footer; follow-up
+chunks add a "continued (N/M)" header.
+
+## Forum topics (workspace mode)
+
+!!! info "Mode requirement"
+    Forum topics are used by **workspace mode** only. Assistant and handoff modes don't use topics. See [Workflow modes](../modes.md) for the full comparison.
+
+If you chose the **workspace** workflow during onboarding, topics are already enabled.
+Topics bind Telegram forum threads to a project/branch and persist resume tokens per
+topic, so replies keep the right context even after restarts.
+
+Configuration (under `[transports.telegram]`):
+
+=== "untether config"
+
+    ```sh
+    untether config set transports.telegram.topics.enabled true
+    untether config set transports.telegram.topics.scope "auto"
+    ```
+
+=== "toml"
+
+    ```toml
+    [transports.telegram.topics]
+    enabled = true
+    scope = "auto" # auto | main | projects | all
+    ```
+
+Requirements:
+
+- `main`: `chat_id` must be a forum-enabled supergroup (topics enabled).
+- `projects`: each `projects.<alias>.chat_id` must point to a forum-enabled
+  supergroup for that project.
+- `all`: both the main chat and each project chat must be forum-enabled.
+- `auto`: if any project chats are configured, uses `projects`; otherwise `main`.
+- The bot needs the **Manage Topics** permission in the relevant chat(s).
+
+Commands:
+
+- `main`: `/topic <project> @branch` creates a topic in the main chat and binds it.
+- `projects`: `/topic @branch` creates a topic in the project chat and binds it.
+- `all`: use `/topic <project> @branch` in the main chat, or `/topic @branch` in
+  project chats.
+- `/ctx` shows the bound context and stored session engines inside topics.
+  Outside topics, `/ctx set ...` and `/ctx clear` bind the chat context.
+- `/new` inside a topic cancels any running task and clears stored resume tokens for that topic.
+
+State is stored in `telegram_topics_state.json` alongside the config file.
+Delete it to reset all topic bindings and stored sessions.
+
+Note: main chat topics do not assume a default project; topics must be bound
+before running without directives.
+
+## Outbox model
+
+- Single worker processes one op at a time.
+- Each op is keyed; only one pending op per key.
+- New ops with the same key overwrite the payload but **do not** reset
+  `queued_at` (fairness).
+
+Keys (include `chat_id` to avoid cross-chat collisions):
+
+- `("edit", chat_id, message_id)` for edits (coalesced).
+- `("delete", chat_id, message_id)` for deletes.
+- `("send", chat_id, replace_message_id)` when replacing a progress message.
+- Unique key for normal sends.
+
+Scheduling:
+
+- Ordered by `(priority, queued_at)`.
+- Priorities: send=0, delete=1, edit=2.
+- Within a priority tier, the oldest pending op runs first.
+
+## Callback answering
+
+Inline-keyboard button presses (Approve/Deny, plan-outline Pause, `/config`
+toggles, `AskUserQuestion` options) produce Telegram `callback_query` updates.
+The Bot API requires us to call `answerCallbackQuery` within **30 seconds** of
+the press; if we don't, the *user's* Telegram client surfaces
+`BotResponseTimeoutError`. The work Untether then performs (writing control
+responses to Claude's PTY, editing feedback messages, etc.) happens
+independently — answering just clears the spinner.
+
+Backends that want a visible toast ("Approved" / "Denied" / …) set
+`answer_early = True` and provide `early_answer_toast(args_text) -> str | None`.
+Dispatch hits `answerCallbackQuery` via that path **before** calling
+`backend.handle(ctx)` so the Telegram ack never blocks on slow downstream
+work. The invariant is covered by a regression test
+(`tests/test_callback_dispatch.py::test_early_answer_fires_before_slow_handle`).
+
+Every answer emits a structured INFO log for observability:
+
+```
+callback.answered command=<id> chat_id=<n>
+  latency_ms=<ms>   # just the answerCallbackQuery HTTP round-trip
+  total_ms=<ms>     # since the dispatcher entered handle_callback
+  early=true|false  # whether the early-answer path fired
+  has_toast=true|false
+```
+
+Use `journalctl --user -u untether --since ... | grep callback.answered` to
+tell "we were fast, Telegram was slow" (high `latency_ms`) apart from "we were
+slow before reaching Telegram" (high `total_ms` with low `latency_ms`).
+
+Client-side `BotResponseTimeoutError` reports a round-trip that exceeded the
+Bot API's 30 s window — they can still fire if Telegram itself is slow or if
+the local network is congested, even when `latency_ms` is well under 30 s.
+The ordering invariant above is what prevents *our* work from ever being
+the cause.
+
+## Rate limiting + backoff
+
+- Per-chat pacing is computed from `private_chat_rps` and `group_chat_rps`.
+  Defaults: 1.0 msg/s for private, 20/60 msg/s for groups (≈1 message every 3s).
+- Pacing is enforced per-chat via `_next_at[chat_id]`; each chat tracks its own
+  earliest-allowed send time independently.
+- The worker picks the highest-priority ready op whose chat is not blocked.
+  On 429, `retry_at` blocks all chats globally until the retry window expires.
+- On 429, `RetryAfter` is raised using `parameters.retry_after` when present;
+  if missing, we fall back to a 5s delay. The outbox sets `retry_at` and
+  requeues the op if no newer op for the same key has arrived.
+
+## Error handling
+
+- Non-429 errors are logged and dropped (no retry).
+- On `RetryAfter`, the op is retried unless a newer op superseded the same key.
+
+## Replace progress messages
+
+`send_message(replace_message_id=...)`:
+
+- Drops any pending edit for that progress message.
+- Enqueues the send at highest priority.
+- If the send succeeds, enqueues a delete for the old progress message.
+
+This keeps the final message first and avoids deleting progress if the send
+fails.
+
+## getUpdates
+
+`get_updates` bypasses the outbox and retries on `RetryAfter` by sleeping
+for the provided delay.
+
+## Close semantics
+
+`TelegramClient.close()` shuts down the outbox and closes the HTTP client.
+Pending ops are failed with `None` (best-effort).

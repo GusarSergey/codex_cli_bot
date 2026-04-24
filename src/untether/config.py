@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import tomli_w
+
+from .logging import get_logger
+
+logger = get_logger(__name__)
+
+HOME_CONFIG_PATH = Path.home() / ".untether" / "untether.toml"
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def ensure_table(
+    config: dict[str, Any],
+    key: str,
+    *,
+    config_path: Path,
+    label: str | None = None,
+) -> dict[str, Any]:
+    value = config.get(key)
+    if value is None:
+        table: dict[str, Any] = {}
+        config[key] = table
+        return table
+    if not isinstance(value, dict):
+        name = label or key
+        raise ConfigError(f"Invalid `{name}` in {config_path}; expected a table.")
+    return value
+
+
+def read_config(cfg_path: Path) -> dict:
+    if cfg_path.exists() and not cfg_path.is_file():
+        logger.error("config.read.not_file", path=str(cfg_path))
+        raise ConfigError(f"Config path {cfg_path} exists but is not a file.") from None
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.warning("config.read.missing", path=str(cfg_path))
+        raise ConfigError(f"Missing config file {cfg_path}.") from None
+    except OSError as e:
+        logger.error("config.read.os_error", path=str(cfg_path), error=str(e))
+        raise ConfigError(f"Failed to read config file {cfg_path}: {e}") from e
+    try:
+        return tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as e:
+        logger.error("config.read.toml_error", path=str(cfg_path), error=str(e))
+        raise ConfigError(f"Malformed TOML in {cfg_path}: {e}") from None
+
+
+def load_or_init_config(path: str | Path | None = None) -> tuple[dict, Path]:
+    if path is None:
+        env_path = os.environ.get("UNTETHER_CONFIG_PATH")
+        if env_path:
+            path = env_path
+    cfg_path = Path(path).expanduser() if path else HOME_CONFIG_PATH
+    if cfg_path.exists() and not cfg_path.is_file():
+        raise ConfigError(f"Config path {cfg_path} exists but is not a file.") from None
+    if not cfg_path.exists():
+        return {}, cfg_path
+    return read_config(cfg_path), cfg_path
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectConfig:
+    alias: str
+    path: Path
+    worktrees_dir: Path
+    default_engine: str | None = None
+    worktree_base: str | None = None
+    chat_id: int | None = None
+
+    @property
+    def worktrees_root(self) -> Path:
+        if self.worktrees_dir.is_absolute():
+            return self.worktrees_dir
+        return self.path / self.worktrees_dir
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectsConfig:
+    projects: dict[str, ProjectConfig]
+    default_project: str | None = None
+    chat_map: dict[int, str] = field(default_factory=dict)
+
+    def resolve(self, alias: str | None) -> ProjectConfig | None:
+        if alias is None:
+            if self.default_project is None:
+                logger.debug(
+                    "config.resolve.failed", alias=alias, reason="no_default_project"
+                )
+                return None
+            result = self.projects.get(self.default_project)
+            if result is None:
+                logger.debug(
+                    "config.resolve.failed",
+                    alias=self.default_project,
+                    reason="default_project_not_found",
+                )
+            return result
+        result = self.projects.get(alias.lower())
+        if result is None:
+            logger.debug("config.resolve.failed", alias=alias, reason="alias_not_found")
+        return result
+
+    def project_for_chat(self, chat_id: int | str | None) -> str | None:
+        if chat_id is None:
+            return None
+        if isinstance(chat_id, str):
+            return None
+        return self.chat_map.get(chat_id)
+
+    def project_chat_ids(self) -> tuple[int, ...]:
+        return tuple(self.chat_map.keys())
+
+
+def dump_toml(config: dict[str, Any]) -> str:
+    try:
+        dumped = tomli_w.dumps(config)
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"Unsupported config value: {e}") from None
+    return dumped
+
+
+def write_config(config: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dump_toml(config)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+        logger.debug("config.written", path=str(path))
+    except OSError as e:
+        logger.error("config.write.failed", path=str(path), error=str(e))
+        raise ConfigError(f"Failed to write config file {path}: {e}") from e
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug(
+                    "config.write.cleanup_failed",
+                    path=str(tmp_path),
+                    error=str(exc),
+                )
