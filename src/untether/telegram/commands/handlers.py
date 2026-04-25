@@ -13,6 +13,7 @@ from .media import _handle_media_group as handle_media_group
 from .menu import _reserved_commands as get_reserved_commands
 from .menu import _set_command_menu as set_command_menu
 from .model import _handle_model_command as handle_model_command
+from .project import _handle_project_command as handle_project_command
 from .parse import _parse_slash_command as parse_slash_command
 from .reasoning import _handle_reasoning_command as handle_reasoning_command
 from .topics import _handle_chat_ctx_command as handle_chat_ctx_command
@@ -34,6 +35,7 @@ __all__ = [
     "handle_file_put_default",
     "handle_media_group",
     "handle_model_command",
+    "handle_project_command",
     "handle_new_command",
     "handle_reasoning_command",
     "handle_topic_command",

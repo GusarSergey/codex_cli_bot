@@ -16,3 +16,4 @@ WshShell.Run Chr(34) & "$startScript" & Chr(34), 0
 
 Set-Content -Path $startupScript -Value $vbs -Encoding ASCII
 Write-Host "Startup script installed:" $startupScript
+Write-Host "Canonical launcher:" $startScript

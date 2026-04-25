@@ -18,16 +18,17 @@ This repository is set up to run Codex through Telegram on Windows with:
 - `run_untether_detached.pyw` to launch Untether outside the active Codex desktop session
 - `codex_auth.bat` to run Codex authentication in the same environment
 - `install_windows_startup.ps1` to install autostart for Windows
+- `..\start_untether.bat` and `..\run_untether_detached.pyw` as compatibility wrappers that redirect into this folder
 
 ## Quick Start
 
 1. Install Codex CLI.
 2. Install Untether dependencies for this repo.
 3. Configure your Telegram bot token in your Untether config.
-4. Start the bridge:
+4. Start the bridge from this folder:
 
 ```bat
-start_untether.bat
+untether\start_untether.bat
 ```
 
 5. Send a test message to your Telegram bot.
@@ -47,9 +48,9 @@ The bridge is supervised. If the worker exits unexpectedly, `supervise_untether.
 ## Daily Commands
 
 ```bat
-start_untether.bat
-stop_untether.bat
-codex_auth.bat
+untether\start_untether.bat
+untether\stop_untether.bat
+untether\codex_auth.bat
 ```
 
 ## Logs
@@ -75,9 +76,19 @@ If the bot stops answering:
 3. Restart the bridge:
 
 ```bat
-stop_untether.bat
-start_untether.bat
+untether\stop_untether.bat
+untether\start_untether.bat
 ```
+
+## Canonical Launch Path
+
+Use only the launchers inside the `untether\` folder for normal work:
+
+- `untether\start_untether.bat`
+- `untether\stop_untether.bat`
+- `untether\run_untether_detached.pyw`
+
+Root-level files with the same names are kept only as compatibility redirects so older shortcuts do not start a second bridge instance.
 
 ## Upstream
 

@@ -110,6 +110,10 @@ class TestCodexBuildArgs:
         runner = self._runner()
         state = runner.new_state("hello", None)
         args = runner.build_args("hello", None, state=state)
+        assert "--sandbox" in args
+        sandbox_idx = args.index("--sandbox")
+        assert args[sandbox_idx + 1] == "danger-full-access"
+        assert "--full-auto" in args
         assert "exec" in args
         assert "--json" in args
         assert args[-1] == "-"
@@ -166,6 +170,10 @@ class TestCodexBuildArgs:
         opts = RunOptions(permission_mode="safe")
         with patch("untether.runners.codex.get_run_options", return_value=opts):
             args = runner.build_args("hello", None, state=state)
+        assert "--sandbox" in args
+        sandbox_idx = args.index("--sandbox")
+        assert args[sandbox_idx + 1] == "workspace-write"
+        assert "--full-auto" in args
         assert "--ask-for-approval" in args
         idx = args.index("--ask-for-approval")
         assert args[idx + 1] == "untrusted"
@@ -178,6 +186,10 @@ class TestCodexBuildArgs:
         opts = RunOptions(permission_mode=None)
         with patch("untether.runners.codex.get_run_options", return_value=opts):
             args = runner.build_args("hello", None, state=state)
+        assert "--sandbox" in args
+        sandbox_idx = args.index("--sandbox")
+        assert args[sandbox_idx + 1] == "danger-full-access"
+        assert "--full-auto" in args
         assert "--ask-for-approval" in args
         idx = args.index("--ask-for-approval")
         assert args[idx + 1] == "never"
@@ -188,6 +200,10 @@ class TestCodexBuildArgs:
         runner = self._runner()
         state = runner.new_state("hello", None)
         args = runner.build_args("hello", None, state=state)
+        assert "--sandbox" in args
+        sandbox_idx = args.index("--sandbox")
+        assert args[sandbox_idx + 1] == "danger-full-access"
+        assert "--full-auto" in args
         assert "--ask-for-approval" in args
         idx = args.index("--ask-for-approval")
         assert args[idx + 1] == "never"

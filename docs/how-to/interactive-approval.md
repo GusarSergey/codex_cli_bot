@@ -120,8 +120,8 @@ Toggle via `/config` → **Approval policy**:
 
 | Policy | CLI flag | Behaviour |
 |--------|----------|-----------|
-| **Full auto** (default) | (none) | All tools approved — Codex runs without restriction |
-| **Safe** | `--ask-for-approval untrusted` | Only trusted commands run; untrusted tools are blocked |
+| **Full auto** (default) | `--sandbox danger-full-access --full-auto --ask-for-approval never` | All tools approved — Codex can read, write, run commands, and complete git operations autonomously |
+| **Safe** | `--sandbox workspace-write --full-auto --ask-for-approval untrusted` | Workspace writes are allowed, but untrusted actions are blocked |
 
 This is a pre-run policy — Codex doesn't pause mid-run to ask for permission. The policy is set before the run starts.
 

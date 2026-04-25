@@ -76,7 +76,7 @@ The active option is marked with a ✓ prefix. Tap a different option to switch.
 Settings are engine-specific and only appear when relevant:
 
 - **Plan mode** — Claude Code only. Codex and Gemini have their own pre-run policies instead.
-- **Approval policy** — Codex CLI only. Toggle between "full auto" (default, all tools approved) and "safe" (untrusted tools blocked via `--ask-for-approval untrusted`). This is a pre-run policy — not interactive mid-run approval.
+- **Approval policy** — Codex CLI only. Toggle between "full auto" (default, runs Codex with `--sandbox danger-full-access --full-auto --ask-for-approval never`) and "safe" (runs with `--sandbox workspace-write --full-auto --ask-for-approval untrusted`). This is a pre-run policy — not interactive mid-run approval.
 - **Approval mode** — Gemini CLI only. Toggle between "read-only" (default, write tools blocked), "edit files" (file reads/writes OK, shell commands blocked via `--approval-mode auto_edit`), and "full access" (all tools approved via `--approval-mode yolo`). This is a pre-run policy.
 - **Ask mode** and **Diff preview** — Claude Code only. Hidden for other engines.
 - **Reasoning** — Claude Code and Codex only. Hidden for OpenCode, Pi, Gemini, and Amp.

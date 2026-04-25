@@ -43,6 +43,7 @@ _RECONNECTING_RE = re.compile(
 )
 _EXEC_ONLY_FLAGS = {
     "--ask-for-approval",
+    "--full-auto",
     "--skip-git-repo-check",
     "--json",
     "--output-schema",
@@ -500,6 +501,14 @@ class CodexRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                         f"model_reasoning_effort={run_options.reasoning}",
                     ]
                 )
+        # Codex CLI now exposes sandbox and approval tiers explicitly. In
+        # Telegram runs we must set both, otherwise "full auto" can still end
+        # up too constrained for git/index writes in some environments.
+        if run_options is not None and run_options.permission_mode == "safe":
+            args.extend(["--sandbox", "workspace-write"])
+        else:
+            args.extend(["--sandbox", "danger-full-access"])
+        args.append("--full-auto")
         if run_options is not None and run_options.permission_mode == "safe":
             args.extend(["--ask-for-approval", "untrusted"])
         else:

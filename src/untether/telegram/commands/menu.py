@@ -74,6 +74,7 @@ def build_bot_commands(
         ("new", "start a new thread"),
         ("continue", "continue most recent CLI session"),
         ("ctx", "show or update context"),
+        ("project", "register path and switch project"),
         ("agent", "set default engine"),
         ("model", "set model override"),
         ("reasoning", "set reasoning override"),

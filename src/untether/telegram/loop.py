@@ -43,6 +43,7 @@ from .commands.handlers import (
     handle_file_put_default,
     handle_media_group,
     handle_model_command,
+    handle_project_command,
     handle_new_command,
     handle_reasoning_command,
     handle_topic_command,
@@ -426,6 +427,17 @@ def _dispatch_builtin_command(
             chat_prefs,
             resolved_scope=resolved_scope,
             scope_chat_ids=scope_chat_ids,
+        )
+        task_group.start_soon(handler)
+        return True
+
+    if command_id == "project":
+        handler = partial(
+            handle_project_command,
+            cfg,
+            msg,
+            args_text,
+            chat_prefs,
         )
         task_group.start_soon(handler)
         return True

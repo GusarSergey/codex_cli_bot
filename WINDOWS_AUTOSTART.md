@@ -8,6 +8,8 @@ This repo includes a Windows-specific launcher stack for the Telegram bridge:
 - `install_windows_startup.ps1` installs a hidden startup item in the current user's Startup folder
 - `stop_untether.bat` stops the supervisor and worker processes for this repo
 
+These paths are relative to the `untether\` folder. Root-level files with the same names are compatibility wrappers only and should not be used as the primary launch path.
+
 ## Install Autostart
 
 ```powershell
@@ -19,9 +21,9 @@ After installation, Windows starts the bridge automatically when the current use
 ## Manual Control
 
 ```bat
-start_untether.bat
-stop_untether.bat
-codex_auth.bat
+untether\start_untether.bat
+untether\stop_untether.bat
+untether\codex_auth.bat
 ```
 
 ## Recovery
@@ -33,8 +35,8 @@ If Telegram stops responding:
 3. Restart the bridge:
 
 ```bat
-stop_untether.bat
-start_untether.bat
+untether\stop_untether.bat
+untether\start_untether.bat
 ```
 
 The supervisor is designed to restart the worker automatically after unexpected exits.

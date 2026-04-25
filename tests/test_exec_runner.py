@@ -136,6 +136,9 @@ def test_codex_exec_flags_after_exec() -> None:
     assert args == [
         "-c",
         "notify=[]",
+        "--sandbox",
+        "danger-full-access",
+        "--full-auto",
         "--ask-for-approval",
         "never",
         "exec",

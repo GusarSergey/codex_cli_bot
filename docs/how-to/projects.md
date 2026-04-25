@@ -31,6 +31,27 @@ This adds a project to your config:
     path = "~/dev/happy-gadgets"
     ```
 
+## Register and switch from Telegram
+
+If you're already in Telegram and want the current chat to move to another repo,
+use:
+
+```
+/project use "D:\path\to\repo"
+```
+
+Untether will:
+
+1. Register the directory as a project alias automatically
+2. Hot-reload the runtime config
+3. Bind the current chat to that project immediately
+
+If you only want to register the repo without switching the chat:
+
+```
+/project add "D:\path\to\repo"
+```
+
 ## Target a project from chat
 
 Send:
