@@ -41,18 +41,38 @@ def _pid_running(pid: int | None) -> bool:
 
 def _acquire_lock() -> bool:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        data = None
-    if isinstance(data, dict):
-        existing_pid = data.get("pid")
-        if isinstance(existing_pid, int) and _pid_running(existing_pid):
-            _log(f"already running with pid={existing_pid}")
-            return False
     payload = {"pid": os.getpid(), "started_at": time.time()}
-    LOCK_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return True
+    serialized = json.dumps(payload, indent=2) + "\n"
+    while True:
+        try:
+            fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                data = None
+            if isinstance(data, dict):
+                existing_pid = data.get("pid")
+                if isinstance(existing_pid, int) and _pid_running(existing_pid):
+                    _log(f"already running with pid={existing_pid}")
+                    return False
+            try:
+                LOCK_PATH.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(serialized)
+        except Exception:
+            try:
+                LOCK_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return True
 
 
 def _release_lock() -> None:
