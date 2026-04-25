@@ -2465,6 +2465,7 @@ async def handle_message(
 
     final_answer = completed.answer
     final_answer, git_handoff = extract_git_handoff(final_answer)
+    git_result = None
 
     # If there's a plan outline stored in a synthetic warning action,
     # prepend it to the final answer so the user can read it.
@@ -2663,6 +2664,21 @@ async def handle_message(
         delete_tag="final",
         thread_id=incoming.thread_id,
     )
+
+    if git_result is not None and git_result.status == "pushed":
+        notify_message = RenderedMessage(
+            text=f"✅ Git pushed: `{git_result.commit_hash or 'unknown'}`",
+            extra={},
+        )
+        await cfg.transport.send(
+            channel_id=incoming.channel_id,
+            message=notify_message,
+            options=SendOptions(
+                reply_to=user_ref,
+                notify=True,
+                thread_id=incoming.thread_id,
+            ),
+        )
 
     # Unregister progress persistence after the final message is sent.
     # Must happen AFTER send_result_message() so a crash between

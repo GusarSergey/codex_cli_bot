@@ -341,6 +341,48 @@ async def test_handle_message_executes_git_handoff(tmp_path) -> None:
 
 
 @pytest.mark.anyio
+async def test_handle_message_sends_git_push_notification(monkeypatch, tmp_path) -> None:
+    import untether.runner_bridge as rb
+    from untether.git_handoff import GitHandoffResult
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    transport = FakeTransport()
+    answer = (
+        "Done.\n\n```untether-git\n"
+        '{"files":["BRAIN.md"],"message":"docs: bridge handoff","push":true}\n'
+        "```"
+    )
+    runner = _return_runner(answer=answer)
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+
+    monkeypatch.setattr(
+        rb,
+        "execute_git_handoff",
+        lambda handoff, *, cwd: GitHandoffResult(
+            status="pushed",
+            summary="Bridge git: committed `abc1234` and pushed successfully.",
+            commit_hash="abc1234",
+        ),
+    )
+
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+        resume_token=None,
+        cwd=repo,
+    )
+
+    assert transport.send_calls[-1]["message"].text == "✅ Git pushed: `abc1234`"
+    assert transport.send_calls[-1]["options"].notify is True
+
+
+@pytest.mark.anyio
 async def test_progress_edits_are_best_effort() -> None:
     transport = FakeTransport()
     clock = _FakeClock()
