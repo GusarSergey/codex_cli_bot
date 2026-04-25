@@ -54,3 +54,10 @@ def test_default_preamble_includes_outbox_instructions() -> None:
     """Default preamble tells agents about the .untether-outbox/ delivery mechanism."""
     assert ".untether-outbox/" in _DEFAULT_PREAMBLE
     assert "/file get" in _DEFAULT_PREAMBLE
+
+
+def test_default_preamble_includes_git_guardrails() -> None:
+    """Default preamble tells agents to verify git blockers before claiming failure."""
+    assert "Git commit/push are allowed" in _DEFAULT_PREAMBLE
+    assert ".git/index.lock" in _DEFAULT_PREAMBLE
+    assert "git add <file>" in _DEFAULT_PREAMBLE
