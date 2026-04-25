@@ -1,5 +1,6 @@
 import contextlib
 import os
+import subprocess
 import sys
 import uuid
 
@@ -269,6 +270,74 @@ async def test_long_final_message_edits_progress_message() -> None:
     assert transport.send_calls[0]["options"].notify is False
     assert transport.edit_calls
     assert "done" in transport.edit_calls[-1]["message"].text.lower()
+
+
+@pytest.mark.anyio
+async def test_handle_message_executes_git_handoff(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    (repo / "BRAIN.md").write_text("line 1\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "BRAIN.md"],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    (repo / "BRAIN.md").write_text("line 1\nline 2\n", encoding="utf-8")
+
+    transport = FakeTransport()
+    answer = (
+        "Done.\n\n```untether-git\n"
+        '{"files":["BRAIN.md"],"message":"docs: bridge handoff","push":false}\n'
+        "```"
+    )
+    runner = _return_runner(answer=answer)
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+        resume_token=None,
+        cwd=repo,
+    )
+
+    final_text = transport.send_calls[-1]["message"].text
+    assert "Bridge git: committed" in final_text
+    assert "untether-git" not in final_text
 
 
 @pytest.mark.anyio

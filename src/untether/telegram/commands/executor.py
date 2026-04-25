@@ -301,6 +301,7 @@ async def _run_engine(
                             on_thread_known=on_thread_known,
                             on_resume_failed=on_resume_failed,
                             progress_ref=progress_ref,
+                            cwd=cwd,
                         )
                 finally:
                     typing_stop.set()

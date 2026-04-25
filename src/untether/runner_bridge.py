@@ -12,6 +12,7 @@ from typing import Any
 import anyio
 
 from .context import RunContext
+from .git_handoff import execute_git_handoff, extract_git_handoff
 from .error_hints import get_error_hint as _get_error_hint
 from .logging import bind_run_context, get_logger
 from .markdown import format_meta_line, render_event_cli
@@ -283,6 +284,11 @@ _DEFAULT_PREAMBLE = (
     "itself returned that exact error.\n"
     "- When a task explicitly requires commit/push, prefer targeted commands such as "
     "`git add <file>`, then `git commit`, then `git push`, instead of a broad `git add .`.\n\n"
+    "When a task requires commit/push, append this hidden handoff block at the end of "
+    "your final answer so the bridge can finish git operations reliably if needed:\n"
+    "```untether-git\n"
+    '{"files":["relative/path.ext"],"message":"type: concise commit message","push":true}\n'
+    "```\n\n"
     "Every response that completes work MUST end with a structured summary:\n"
     "  ## Summary\n"
     "  ### Completed\n"
@@ -2163,6 +2169,7 @@ async def handle_message(
     | None = None,
     on_resume_failed: Callable[[ResumeToken], Awaitable[None]] | None = None,
     progress_ref: MessageRef | None = None,
+    cwd: Path | None = None,
     clock: Callable[[], float] = time.monotonic,
     _auto_continued_count: int = 0,
 ) -> None:
@@ -2457,6 +2464,7 @@ async def handle_message(
     # --- End auto-continue ---
 
     final_answer = completed.answer
+    final_answer, git_handoff = extract_git_handoff(final_answer)
 
     # If there's a plan outline stored in a synthetic warning action,
     # prepend it to the final answer so the user can read it.
@@ -2526,6 +2534,13 @@ async def handle_message(
                 )
             else:
                 final_answer = f"```\n{raw_error}\n```"
+
+    if git_handoff is not None and cwd is not None:
+        git_result = execute_git_handoff(git_handoff, cwd=cwd)
+        if final_answer.strip():
+            final_answer = f"{final_answer}\n\n{git_result.summary}"
+        else:
+            final_answer = git_result.summary
 
     status = (
         "error" if run_ok is False else ("done" if final_answer.strip() else "error")

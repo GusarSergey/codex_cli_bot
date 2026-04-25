@@ -61,3 +61,4 @@ def test_default_preamble_includes_git_guardrails() -> None:
     assert "Git commit/push are allowed" in _DEFAULT_PREAMBLE
     assert ".git/index.lock" in _DEFAULT_PREAMBLE
     assert "git add <file>" in _DEFAULT_PREAMBLE
+    assert "untether-git" in _DEFAULT_PREAMBLE

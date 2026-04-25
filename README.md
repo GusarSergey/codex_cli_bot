@@ -66,6 +66,7 @@ Use these files first when Telegram stops responding:
 - Codex is launched through a hardened Windows path so `codex.cmd` is used correctly.
 - The Telegram bridge is detached from the active Codex desktop window, so it can keep working in the background.
 - Optional engine import failures on Windows should not block Telegram startup.
+- When a Telegram task explicitly requires `git commit` / `git push`, the bridge can finish those operations from a hidden `untether-git` handoff block in the agent's final answer. This is the reliability path for tasks where Codex edits files correctly but its own in-session git step is flaky.
 
 ## Recovery
 
